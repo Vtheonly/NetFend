@@ -134,7 +134,38 @@ The next agent must not have to rediscover the same problem.
 - Gateway MAC learned once at startup goes stale: a legitimate router
   change or DHCP event makes old "protections" poison traffic with wrong
   mappings. Gateway identity is re-baselined on every network change and
-  confirmed via multiple observations before enforcement.
+  confirmed via multiple observations before enforcement. **Trust must
+  also move when the ARP guard accepts a legitimate gateway change** —
+  the evaluator re-baselines itself and calls the engine callback
+  (re-pin + arp-table rebuild). Forgetting the callback reintroduces the
+  P-19 event flood (found live 2026-10-15: 106 identical
+  `arp.gateway_change` events in ~3 min).
+- Firewall changes must never be all-or-nothing across tables (found
+  live 2026-10-15, P-18): a rejected `inet` filter ruleset must not
+  block the `arp` table — apply tables independently, each with a
+  simpler fallback ruleset, and always surface the actual `nft` stderr
+  in the event (an event that says "validation failed" without the
+  error text is undiscoverable).
+- Every event type that can fire per-packet needs a dedup/cooldown path:
+  the EventStore folds identical (kind, summary) events within
+  `event_dedup_window_s`, and evaluators add their own per-MAC cooldowns.
+  A detection without rate control becomes a self-inflicted log flood
+  (P-19/P-21).
+- `nft -c` validation results depend on the local nft version: meters
+  (per-source dynamic sets) are the least portable construct. New rules
+  go into the full variant only; the basic/minimal fallbacks must stay
+  meter-free (P-18).
+- BOOTP `siaddr` is routinely `0.0.0.0` — never use it as a DHCP server
+  identity; prefer DHCP option 54 (P-23). A DHCP server identifying as
+  the current gateway IP and offering it as the router option is mesh
+  infrastructure, not a rogue (flag as notice, learn into baseline).
+- `127.0.0.53` in resolv.conf is the systemd-resolved stub — resolve it
+  back to effective upstreams (resolvectl) before comparing resolver
+  sets, or every Wi-Fi reconnect looks like DNS manipulation (P-24).
+- `EventStore()` starts with an EMPTY ring: anything that must survive
+  process restarts (CLI `--events`, dashboard history) relies on
+  `_load_tail()` seeding from the JSONL (P-27). New stores that skip
+  loading must have a reason.
 - Deauth detection requires monitor mode or specific driver support; most
   client adapters cannot see management frames destined to other stations.
   Never claim detection capability the hardware cannot provide — report

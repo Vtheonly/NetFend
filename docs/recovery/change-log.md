@@ -223,3 +223,65 @@ Docs closed: task registry T-0…T-19 all DONE with evidence; problems
 P-1…P-12, P-16, P-17 FIXED; P-13…P-15 documented limitations; U-1…U-5
 carry next steps. All commits pushed to `main` on
 github.com/Vtheonly/NetFend (single-branch policy per AGENTS.md §6).
+
+2026-10-16 — **Field-report round** (T-20…T-28, problems P-18…P-27) —
+Context: the owner pushed `report.md` + the legacy engine under `old/`
+from a live session on the real network (192.168.100.0/24, wlo1,
+gateway 192.168.100.1). The report contained dashboard telemetry,
+terminal output of the legacy engine, and the request: "make it have
+single entry like I did" + "somehow the old engine works better".
+Analysis of the report produced 10 new problems (P-18…P-27), all fixed
+and regression-tested:
+
+- **T-20 / P-18 (critical):** firewall had left the host with ZERO
+  protection — all-or-nothing validation meant the ARP table was never
+  applied when the inet filter ruleset was rejected, and events carried
+  no nft stderr. Now: per-table independent validation (ARP first),
+  fallback ladder full→basic→minimal per table, real error text in
+  events, invalid strict-profile rule removed.
+- **T-21 / P-19 (critical):** gateway_change event spam (106 rows /
+  3 min) — evaluator never re-baselined after a "legitimate change"
+  verdict. Now: accepted change re-baselines trust and notifies the
+  engine (re-pin + firewall rebuild via daemon-thread callback);
+  returning former MACs classify as `arp.gateway_oscillation`
+  (aggregated, trust kept); overlapping claims remain spoof conflicts.
+- **T-22 / P-21+P-27:** EventStore dedup (identical events within 10 s
+  fold into repeat_count, "×N" badge in the UI; JSONL keeps the first
+  occurrence per burst) and ring seeding from the JSONL tail — which
+  also fixed `netfend --events` always printing nothing after restart.
+- **T-23 / P-20+P-22 (ADR-006):** new `active_defense.py` — the safe
+  subset of the legacy engine's effectiveness: kernel gateway re-pin +
+  bounded self-assertion GARP (≤5 packets, hard ceiling 10,
+  event-triggered only, 60 s cooldown, own identity only, explicit L2
+  frames). `defense.corrective_action` events; dashboard panel state;
+  AST safety tests enforce it stays the only sender.
+- **T-24 / P-23:** DHCP false positive fixed — server identity now
+  prefers option 54, never keys on 0.0.0.0; gateway-identity servers
+  (mesh nodes) learn as infrastructure with a notice; baselines
+  persist across restarts.
+- **T-25 / P-24:** systemd-resolved stub (127.0.0.53) resolved back to
+  effective upstreams; pure stub transitions get one informational
+  event instead of a "manipulation" warning per reconnect.
+- **T-26 / P-25:** threat aging — 14/30/60-day inactivity decays the
+  effective level; stale profiles sink below active ones; returning
+  attackers re-escalate instantly through fresh attacks.
+- **T-27 / P-26:** single entry — `sudo netfend` prints the legacy-
+  style banner and runs engine + dashboard in the foreground;
+  `net_protect`/`net_reset`/`net_watch`/`net_blacklist` launchers
+  installed pointing at the MODERN engine; the installer moves the
+  legacy `/usr/local/bin/net_defender.py` aside as `*.legacy-disabled`;
+  `old/README.md` documents why the legacy engine must never run.
+- **T-28:** registries/unknowns/AGENTS.md traps updated (see
+  problem-registry P-18…P-27, unknowns U-6…U-8, AGENTS.md §5).
+
+Verification: full suite `python3 -m pytest tests/ -q` → **139
+passed** (95 before this round); `bash -n` on all shell scripts;
+non-root CLI smoke test of the single entry; every task committed and
+pushed to `main` individually (a84613d…c33b5b8 + this commit).
+
+Live-network items that still need the owner (documented in U-6…U-8):
+confirm whether 1c:73:e2:* is a mesh system or an attacker (check the
+router admin page); re-run the engine once so the new
+`firewall.validation_failed`/`firewall.fallback` events capture the
+exact nft stderr for the primary ruleset hardening; enable 802.11w/PMF
+on the router to close the deauth vector at -81 dBm signal strength.

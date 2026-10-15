@@ -32,3 +32,12 @@ command output, or documented manual verification). Statuses: `TODO`,
 - Router/AP-side enforcement (needs router admin; README documents recommendations).
 - Frame-level deauth detection on hardware without monitor mode (P-14/U-2).
 - Windows/macOS support (Linux-only; nftables/systemd assumptions documented).
+| T-20 | Firewall: per-table independent validation, fallback ladder, real nft stderr in events, strict-rule fix (P-18) | DONE | Commit "T-20"; `tests/test_network_firewall.py` — 10 new tests (TestFallbackRulesets, TestPerTableApply) incl. live-fire regression "arp applies even when filter fails"; 105 total |
+| T-21 | ARP: gateway trust re-baseline + oscillation detection + engine feedback loop (P-19) | DONE | Commit "T-21"; `tests/test_arp_guard.py::TestGatewayRebaseline` — spam regression (1 event instead of 106), oscillation classification, overlap stays conflict; 110 total |
+| T-22 | EventStore: dedup aggregation + JSONL restart seeding; fixes `--events` always empty (P-21, P-27) | DONE | Commit "T-22"; 5 new tests (folding, window expiry, single JSONL write, restart seeding, corrupt-line tolerance); 115 total |
+| T-23 | Active defense: bounded corrective self-assertion module (ADR-006) (P-20, P-22) | DONE | Commit "T-23"; `tests/test_active_defense.py` (7 tests) + 2 safety invariants (only-sender allowlist, bounded+self-claiming AST); 124 total |
+| T-24 | DHCP: option-54 identity, 0.0.0.0 normalization, mesh-infra correlation, baseline persistence (P-23) | DONE | Commit "T-24"; `tests/test_guards_and_models.py::TestDhcpP23` — 5 new tests; 129 total |
+| T-25 | DNS: systemd-resolved stub benign classification (P-24) | DONE | Commit "T-25"; `TestDnsStubAwareness` — 4 new tests; 133 total |
+| T-26 | Threat profile aging: effective level decay + stale markers + active-first sorting (P-25) | DONE | Commit "T-26"; `TestThreatAging` — 4 new tests; 137 total |
+| T-27 | Single entry (`sudo netfend` banner run) + legacy launchers + installer disables legacy engine (P-26) | DONE | Commit "T-27"; launcher/installer safety tests; `bash -n` all scripts; non-root CLI smoke test; 139 total |
+| T-28 | Field-report closure: registries, unknowns, AGENTS.md traps, README single-entry section | DONE | This commit; problem-registry P-18…P-27, unknowns U-6…U-8, AGENTS.md §5 extended, change-log entries |
