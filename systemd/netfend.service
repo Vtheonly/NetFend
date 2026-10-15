@@ -1,0 +1,51 @@
+[Unit]
+Description=NetFend — Network Defense Engine and Monitoring Dashboard
+Documentation=https://github.com/Vtheonly/NetFend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/python3 /opt/netfend/net_defender.py --service
+ExecStopPost=/opt/netfend/scripts/cleanup.sh
+Restart=on-failure
+RestartSec=5
+WatchdogSec=30
+
+# --- Privilege hardening (defense engine needs raw socket + net admin) ---
+# CAP_NET_RAW: ARP/DHCP packet inspection; CAP_NET_ADMIN: nftables +
+# neighbor table management; CAP_NET_BIND_SERVICE: dashboard on low ports.
+# We intentionally do NOT restrict to a DynamicUser because state must
+# persist in /var/lib/netfend and nftables tables must be owned by root.
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_KILL
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_KILL
+
+# --- Filesystem hardening ---
+ProtectSystem=strict
+ReadWritePaths=/var/lib/netfend /run
+ReadOnlyPaths=/opt/netfend /etc/netfend
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+
+# --- Resource limits (lightweight requirement) ---
+MemoryMax=256M
+CPUQuota=50%
+
+# --- Logging ---
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=netfend
+
+[Install]
+WantedBy=multi-user.target

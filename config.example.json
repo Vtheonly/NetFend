@@ -1,0 +1,26 @@
+{
+  "general": {
+    "interface": null,
+    "dry_run": false,
+    "log_level": "INFO"
+  },
+  "firewall": {
+    "enabled": true,
+    "profile": "standard",
+    "new_conn_rate_per_s": 50,
+    "new_conn_burst": 100,
+    "icmp_rate_per_s": 20,
+    "strict_allowed_tcp_ports": [],
+    "strict_allowed_udp_ports": [53, 67, 68]
+  },
+  "arp": {
+    "gateway_confirmations": 2,
+    "corrective_arp_enabled": true
+  },
+  "dashboard": {
+    "enabled": true,
+    "bind": "127.0.0.1",
+    "port": 8787,
+    "allow_local_readonly": true
+  }
+}
