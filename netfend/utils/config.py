@@ -88,6 +88,7 @@ DEFAULTS: Dict[str, Any] = {
         "log_backups": 3,
         "events_ring_size": 2000,       # in-memory event ring
         "events_file_max_bytes": 2_000_000,
+        "event_dedup_window_s": 10,     # identical events fold into repeat_count (P-21)
     },
     "firewall": {
         "enabled": True,

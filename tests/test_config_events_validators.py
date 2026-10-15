@@ -144,6 +144,81 @@ class TestEventStore:
         s.close()
         s2.close()
 
+    def test_dedup_folds_identical_bursts(self, tmp_path):
+        """P-21 live-fire regression: 106 identical gateway_change events
+        became one row with a repeat_count."""
+        from netfend.models.events import EventStore
+        s = EventStore(path=tmp_path / "e.jsonl", dedup_window_s=10)
+        for _ in range(50):  # 50 identical events within the window
+            s.emit_simple("arp.gateway_change", "notice", "unverified",
+                          "Gateway 192.168.100.1 now announces MAC X")
+        rows = s.query()
+        assert len(rows) == 1
+        assert rows[0]["repeat_count"] == 49
+        # different summaries are NOT folded
+        s.emit_simple("arp.gateway_change", "notice", "unverified",
+                      "Gateway 10.0.0.1 now announces MAC Y")
+        assert len(s.query()) == 2
+        s.close()
+
+    def test_dedup_window_expiry_creates_new_event(self, tmp_path):
+        import time as _time
+        from netfend.models.events import EventStore, SecurityEvent
+        s = EventStore(path=tmp_path / "e.jsonl", dedup_window_s=10)
+        base = _time.time()
+        s.emit(SecurityEvent(kind="k.x", severity="info",
+                             confidence="confirmed", summary="same",
+                             timestamp=base))
+        s.emit(SecurityEvent(kind="k.x", severity="info",
+                             confidence="confirmed", summary="same",
+                             timestamp=base + 5))     # inside window
+        s.emit(SecurityEvent(kind="k.x", severity="info",
+                             confidence="confirmed", summary="same",
+                             timestamp=base + 30))    # outside window
+        rows = s.query()
+        assert len(rows) == 2
+        assert rows[0]["repeat_count"] == 0            # newest: fresh burst
+        assert rows[1]["repeat_count"] == 1            # first burst folded 2
+        s.close()
+
+    def test_dedup_jsonl_keeps_first_occurrence(self, tmp_path):
+        from netfend.models.events import EventStore
+        p = tmp_path / "e.jsonl"
+        s = EventStore(path=p)
+        for _ in range(20):
+            s.emit_simple("k.flap", "notice", "unverified", "identical")
+        s.close()
+        lines = [l for l in p.read_text().splitlines() if l.strip()]
+        assert len(lines) == 1  # burst persisted once, not 20 times
+
+    def test_ring_seeded_from_jsonl_on_restart(self, tmp_path):
+        """CLI --events bug: a fresh EventStore showed nothing because the
+        JSONL history was never loaded into the ring."""
+        from netfend.models.events import EventStore
+        p = tmp_path / "e.jsonl"
+        s = EventStore(path=p)
+        for i in range(5):
+            s.emit_simple("k.hist", "info", "confirmed", f"history {i}")
+        s.close()
+        # simulate a restart (what `netfend --events` does)
+        s2 = EventStore(path=p)
+        rows = s2.query()
+        assert len(rows) == 5
+        assert rows[0]["summary"] == "history 4"   # newest first
+        s2.close()
+
+    def test_corrupt_jsonl_lines_skipped(self, tmp_path):
+        from netfend.models.events import EventStore
+        p = tmp_path / "e.jsonl"
+        p.write_text('{"kind": "k.ok", "severity": "info", '
+                     '"confidence": "confirmed", "summary": "good"}\n'
+                     'NOT JSON AT ALL\n'
+                     '{"kind": "k.ok2", "severity": "info", '
+                     '"confidence": "confirmed", "summary": "also good"}\n')
+        s = EventStore(path=p)
+        assert len(s.query()) == 2
+        s.close()
+
 
 class TestLogging:
     def test_setup_and_rotate_config(self, tmp_path, monkeypatch):

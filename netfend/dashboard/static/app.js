@@ -94,7 +94,7 @@ function renderEvents(container, events) {
       <span class="k">${esc(e.kind)}</span>
       <span class="s sev-${e.severity}">${e.severity}</span>
       <span class="conf conf-${e.confidence}" title="confidence">${e.confidence}</span>
-      <span>${esc(e.summary)}</span>
+      <span>${esc(e.summary)}${e.repeat_count > 0 ? ` <span class="rep" title="identical events folded by dedup">×${e.repeat_count + 1}</span>` : ""}</span>
     </div>`).join("")
     : `<p class="note">No events match the current filters.</p>`;
 }

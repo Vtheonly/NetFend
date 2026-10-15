@@ -90,6 +90,7 @@ canvas { width: 100%; height: auto; background: var(--panel); border-radius: 8px
 .sev-warning { color: var(--warn); font-weight: 600; }
 .sev-critical { color: var(--crit); font-weight: 700; }
 .conf { font-size: 10.5px; padding: 1px 6px; border-radius: 8px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+.ev .rep { color: var(--warn); font-weight: 700; font-size: 11px; white-space: nowrap; }
 .conf.confirmed { color: var(--ok); border-color: var(--ok); }
 .conf.suspected { color: var(--warn); border-color: var(--warn); }
 

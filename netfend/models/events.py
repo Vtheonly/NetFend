@@ -12,6 +12,16 @@ Design notes:
   confirmed events from suspected anomalies).
 - The store is thread-safe; emit() is cheap (lock + deque append + buffered
   file write). Persistence is size-rotated, NOT per-event fsync.
+- Deduplication (P-21, live report 2026-10-15): identical (kind, summary)
+  events inside `event_dedup_window_s` (default 10 s) collapse into the
+  FIRST occurrence with a `repeat_count` — a flapping detection produces
+  one event with "xN" in the UI instead of a hundred identical rows.
+  Dedup updates live in the in-memory ring only; the JSONL keeps the
+  first occurrence per burst.
+- Restart continuity: the ring is seeded from the JSONL tail on startup,
+  so `netfend --events` and the dashboard show recent history instead of
+  starting empty (the CLI constructed a fresh EventStore and silently
+  showed nothing — pre-existing bug found while fixing P-21).
 """
 import json
 import os
@@ -29,6 +39,10 @@ from netfend.utils.config import (
 
 _SEV_ORDER = {SEV_INFO: 0, SEV_NOTICE: 1, SEV_WARNING: 2, SEV_CRITICAL: 3}
 
+# hard cap on the dedup map so a pathological variety of summaries cannot
+# grow it without bound (entries expire with the window anyway)
+_DEDUP_MAP_MAX = 512
+
 
 @dataclass
 class SecurityEvent:
@@ -40,6 +54,7 @@ class SecurityEvent:
     evidence: Dict[str, Any] = field(default_factory=dict)
     interface: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
+    repeat_count: int = 0        # P-21: identical events inside the dedup window
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -52,18 +67,24 @@ class SecurityEvent:
 
 
 class EventStore:
-    """Thread-safe ring buffer + rotating JSONL persistence."""
+    """Thread-safe ring buffer + rotating JSONL persistence + dedup."""
 
     def __init__(self, path: Path = None, ring_size: int = None,
-                 file_max_bytes: int = None):
+                 file_max_bytes: int = None, dedup_window_s: float = None,
+                 load_history: bool = True):
         self.path = Path(path) if path else EVENTS_FILE
         self.ring: Deque[SecurityEvent] = deque(
             maxlen=ring_size or cfg("general", "events_ring_size", 2000)
         )
         self.file_max_bytes = file_max_bytes or cfg("general", "events_file_max_bytes", 2_000_000)
+        self.dedup_window = (dedup_window_s if dedup_window_s is not None
+                             else cfg("general", "event_dedup_window_s", 10))
         self._lock = threading.Lock()
         self._fh = None
         self._bytes_written = 0
+        self._dedup: Dict[tuple, SecurityEvent] = {}
+        if load_history:
+            self._load_tail()
         self._open()
 
     # -- persistence -------------------------------------------------------
@@ -75,6 +96,28 @@ class EventStore:
             self._bytes_written = self._fh.tell()
         except OSError:
             self._fh = None  # persistence unavailable; in-memory still works
+
+    def _load_tail(self):
+        """Seed the ring from the persisted JSONL (restart continuity)."""
+        try:
+            if not self.path.exists():
+                return
+            with open(self.path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            loaded: List[SecurityEvent] = []
+            for line in reversed(lines):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    loaded.append(SecurityEvent.from_dict(json.loads(line)))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                if len(loaded) >= self.ring.maxlen:
+                    break
+            self.ring.extend(reversed(loaded))
+        except OSError:
+            pass  # unreadable history must never block the store
 
     def _rotate_if_needed(self):
         if self._fh is None:
@@ -93,8 +136,23 @@ class EventStore:
 
     # -- public API ---------------------------------------------------------
     def emit(self, event: SecurityEvent) -> SecurityEvent:
+        """Append an event, or fold it into an identical recent event.
+
+        Identical (kind, summary) within the dedup window increments the
+        existing event's repeat_count instead of creating a new row. The
+        persisted JSONL only records the first occurrence of a burst.
+        """
         with self._lock:
+            key = (event.kind, event.summary)
+            now = event.timestamp or time.time()
+            prev = self._dedup.get(key)
+            if prev is not None and (now - prev.timestamp) < self.dedup_window:
+                prev.repeat_count += 1
+                return prev
             self.ring.append(event)
+            self._dedup[key] = event
+            if len(self._dedup) > _DEDUP_MAP_MAX:
+                self._prune_dedup(now)
             if self._fh is not None:
                 try:
                     line = json.dumps(event.to_dict(), default=str) + "\n"
@@ -105,6 +163,13 @@ class EventStore:
                 except OSError:
                     self._fh = None
         return event
+
+    def _prune_dedup(self, now: float) -> None:
+        """Drop dedup entries whose window expired (caller holds lock)."""
+        expired = [k for k, ev in self._dedup.items()
+                   if (now - ev.timestamp) >= self.dedup_window]
+        for k in expired:
+            del self._dedup[k]
 
     def emit_simple(self, kind: str, severity: str, confidence: str,
                     summary: str, source: str = "engine", **evidence) -> SecurityEvent:
