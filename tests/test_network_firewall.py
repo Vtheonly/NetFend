@@ -7,6 +7,8 @@ from netfend.services.network_manager import (
 )
 from netfend.services.firewall import (
     build_filter_ruleset, build_arp_ruleset, parse_nft_counters,
+    build_basic_filter_ruleset, build_minimal_filter_ruleset,
+    build_minimal_arp_ruleset,
     FILTER_TABLE, ARP_TABLE,
 )
 
@@ -140,3 +142,137 @@ class TestFirewallRulesets:
     def test_parse_nft_counters_garbage(self):
         assert parse_nft_counters("garbage") == {}
         assert parse_nft_counters("[]") == {}
+
+
+class TestFallbackRulesets:
+    """P-18: fallback ladder for nft version incompatibility."""
+
+    def test_basic_filter_no_meters(self):
+        rs = build_basic_filter_ruleset("standard", 20, 40)
+        assert f"table inet {FILTER_TABLE}" in rs
+        assert "meter" not in rs          # the whole point of the fallback
+        assert "ct state invalid drop" in rs
+        assert "limit rate over 20/second" in rs
+
+    def test_basic_filter_strict_uses_drop_policy(self):
+        rs = build_basic_filter_ruleset("strict", 20, 40)
+        assert "policy drop;" in rs
+
+    def test_minimal_filter_standard(self):
+        rs = build_minimal_filter_ruleset("standard")
+        assert "ct state invalid drop" in rs
+        assert "limit" not in rs
+        assert "policy accept;" in rs
+
+    def test_minimal_filter_strict_keeps_essentials(self):
+        rs = build_minimal_filter_ruleset("strict")
+        assert "policy drop;" in rs
+        assert "DHCPv4 client" in rs        # never cut off DHCP in strict
+        assert "icmpv6 essential" in rs     # NDP must survive
+
+    def test_minimal_arp_ruleset(self):
+        rs = build_minimal_arp_ruleset("192.168.1.50", "aa:bb:cc:dd:ee:ff")
+        assert f"table arp {ARP_TABLE}" in rs
+        assert "arp saddr mac != aa:bb:cc:dd:ee:ff" in rs
+        assert "gateway IP" not in rs        # own-IP protection only
+
+    def test_strict_full_ruleset_has_no_conflicting_l4_rule(self):
+        """The old strict profile contained `meta l4proto tcp ... udp dport 53`
+        — a protocol conflict nft rejects. It must stay gone (P-18)."""
+        rs = build_filter_ruleset("strict", 50, 100, 20, 40, [22], [53])
+        assert "meta l4proto tcp" not in rs
+        assert "nonsensical" not in rs
+
+
+class TestPerTableApply:
+    """P-18: the ARP table must never be blocked by filter-table failure."""
+
+    @pytest.fixture()
+    def fw(self, events):
+        from netfend.services.firewall import FirewallManager
+
+        class FakeNm:
+            def snapshot(self):
+                return {"interface": "wlan0", "my_ip": "192.168.1.50",
+                        "my_mac": "aa:bb:cc:dd:ee:ff",
+                        "gateway_ip": "192.168.1.1",
+                        "gateway_mac": "11:22:33:44:55:66",
+                        "link_up": True}
+
+        return FirewallManager(FakeNm(), events)
+
+    def test_ladder_falls_back_and_reports_first_error(self, fw, monkeypatch):
+        calls = []
+
+        def fake_check(ruleset):
+            calls.append(ruleset)
+            if "meter" in ruleset:      # full variant rejected
+                return False, "syntax error: meter not supported"
+            return True, None
+
+        monkeypatch.setattr(fw, "_nft_check", fake_check)
+        monkeypatch.setattr(fw, "_nft_apply", lambda rs: (True, None))
+        ok, err = fw._apply_first_valid([
+            ("full", "table inet x { meter y }"),
+            ("minimal", "table inet x { }"),
+        ], "filter")
+        assert ok is True
+        assert err == "syntax error: meter not supported"
+        assert fw.filter_variant == "minimal"
+
+    def test_ladder_all_rejected(self, fw, monkeypatch):
+        monkeypatch.setattr(fw, "_nft_check", lambda rs: (False, "nope"))
+        monkeypatch.setattr(fw, "_nft_apply", lambda rs: (True, None))
+        ok, err = fw._apply_first_valid([("full", "a"), ("minimal", "b")], "filter")
+        assert ok is False
+        assert err == "nope"
+
+    def test_arp_applies_even_when_filter_fails(self, fw, events, monkeypatch):
+        """Live-fire regression (2026-10-15): filter rejection left the host
+        with no ARP protection at all. Now arp wins independently."""
+        monkeypatch.setattr(fw, "available", lambda: True)
+        monkeypatch.setattr(fw, "_selfcheck", lambda: True)
+
+        def fake_check(ruleset):
+            # ARP table (both variants) validates; inet table never does
+            if f"table arp {ARP_TABLE}" in ruleset:
+                return True, None
+            return False, "ip saddr: unsupported in inet table"
+
+        applied_tables = []
+
+        def fake_apply(ruleset):
+            applied_tables.append("arp" if f"table arp {ARP_TABLE}" in ruleset
+                                  else "inet")
+            return True, None
+
+        monkeypatch.setattr(fw, "_nft_check", fake_check)
+        monkeypatch.setattr(fw, "_nft_apply", fake_apply)
+        assert fw.apply() is True
+        assert applied_tables == ["arp"]           # arp applied, inet not
+        assert fw.arp_variant in ("full", "minimal")
+        assert fw.filter_variant is None
+        # validation_failed event must carry the real nft error (P-18)
+        val_failed = [e for e in events.query(limit=50)
+                      if e["kind"] == "firewall.validation_failed"]
+        assert val_failed, "filter failure must be surfaced"
+        assert "ip saddr" in val_failed[0]["evidence"].get("nft_error", "")
+
+    def test_apply_reports_fallback_variant(self, fw, events, monkeypatch):
+        monkeypatch.setattr(fw, "available", lambda: True)
+        monkeypatch.setattr(fw, "_selfcheck", lambda: True)
+
+        def fake_check(ruleset):
+            # full filter uses meters -> reject; basic/minimal pass
+            if "meter" in ruleset:
+                return False, "meter unsupported"
+            return True, None
+
+        monkeypatch.setattr(fw, "_nft_check", fake_check)
+        monkeypatch.setattr(fw, "_nft_apply", lambda rs: (True, None))
+        assert fw.apply() is True
+        assert fw.filter_variant == "basic"
+        assert fw.arp_variant == "full"
+        fallback = [e for e in events.query(limit=50)
+                    if e["kind"] == "firewall.fallback"]
+        assert fallback and fallback[0]["evidence"].get("variant") == "basic"
