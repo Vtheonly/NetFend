@@ -180,7 +180,9 @@ def load_config(path: Path = None) -> Dict[str, Any]:
     # Applied last so it survives any load_config() re-read.
     if os.environ.get("NETFEND_DRY_RUN", "").lower() in ("1", "true", "yes"):
         _config["general"]["dry_run"] = True
-    _warn_unknown_keys(_config, overlay, prefix="")
+    # Warn about keys that are not in DEFAULTS (compare against the base,
+    # not the merged result — unknown keys would otherwise look "known")
+    _warn_unknown_keys(DEFAULTS, overlay, prefix="")
     return _config
 
 

@@ -66,7 +66,7 @@ def health_verdict(v: Dict[str, Any]) -> Dict[str, Any]:
     if not reasons:
         reasons.append("latency, loss, DNS and gateway reachability all nominal")
     return {"status": status,
-            "explanation": "; ".join(reasons).capitalize() + "."}
+            "explanation": "; ".join(reasons) + "."}
 
 
 class MetricsCollector:

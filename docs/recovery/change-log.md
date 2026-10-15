@@ -163,23 +163,63 @@ badges, confirmed-vs-suspected distinction), Network Topology
 "observed", no fabricated links), Performance & Diagnostics (CPU/mem,
 latency/loss, gateway/DNS reachability, Wi-Fi info, slow-internet
 explanation string from health verdict). Evidence:
-tests/test_static_assets.py — required panels/endpoints present in
-HTML/JS, zero external http(s) references; manual review.
-
-2026-10-15 — **T-17** (test suite) —
-What: 90+ unit tests across 14 files; suite runs green on Python 3.12
-without scapy/colorama installed (proves optional-deps requirement).
-Command: `python3 -m pytest tests/ -q` → **96 passed**.
-
-2026-10-15 — **T-18** (README) —
-What: README.md with: overview, threat model (what is and is NOT
-protectable client-side), requirements, install/upgrade/uninstall,
-configuration reference, CLI usage, dashboard access + security notes,
-testing guide (unit + on-target integration commands), troubleshooting,
-resource consumption expectations, limitations. Evidence: rendered
+tests/test_engine_safety.py::TestStaticAssets — required panels/
+endpoints present in HTML/JS, zero external http(s) references; manual
 review.
 
+2026-10-15 — **T-17** (test suite) —
+What: 95 unit tests across 5 files; suite runs green on Python 3.12
+WITHOUT scapy/colorama installed (proves the optional-deps requirement
+on the real reference environment). Command: `python3 -m pytest tests/
+-q` → **95 passed in ~6s**. Coverage: config layering/unknown-key
+warnings/env overrides, EventStore ring+rotation+unwritable-path
+degradation, validators, all parsers (ip route/addr/neigh,
+/proc/net/dev, iw link, nmcli), firewall ruleset generation for both
+profiles + input validation + nft counter parsing, ARP evaluator
+(gateway spoof confirmations, router-replacement false-positive
+control, own-IP conflict, flapping with DHCP-reassignment control,
+garp flood + normal-rate control, malformed input), DHCP evaluator
+(learning window, rogue, option changes), DNS evaluator, Wi-Fi failure
+classifier matrix, metrics rates + health verdicts, threat profile
+escalation/fingerprint-alias/persistence/debounce, device registry
+(authorization preserved under passive observation, save=False),
+engine safety invariants (AST scan: no packet sends in engine/guards,
+no arptables/flush-ruleset anywhere, no interface bouncing, all
+threads daemon; runtime: degraded start, stop < 5s), dashboard auth
+matrix (static+traversal, 7 endpoints, 401 no-token, 401 bad-token,
+403 no-CSRF, 200 token+CSRF, unknown/shell actions 404, bad profile
+400, login rate limit, token never echoed), frontend assets (panels,
+no external URLs, all endpoints called).
+Bugs found BY the tests and fixed immediately (persisted in
+AGENTS.md §5): (1) **DeviceRegistry.forget() deadlock** — save() called
+while holding the non-reentrant lock; the suite hung on it. (2)
+**DhcpEvaluator learning window** counted distinct servers instead of
+observations, so the first unknown server after one known server was
+silently learned; also option baselines were not seeded during
+learning. (3) **config unknown-key warning** compared against the
+merged config (where unknown keys exist) instead of DEFAULTS, so it
+never fired. (4) **health_verdict.capitalize()** lowercased "DNS" in
+the explanation string.
+
+2026-10-15 — **T-18** (README) —
+What: README.md with: overview + honest threat model table (in-scope
+vs out-of-scope with reasons), recommended router-side settings
+(802.11w/PMF etc.), requirements, install (--check/--dry-run/rollback
+behavior), CLI reference, dashboard access + auth model + panels,
+configuration reference with profile semantics, service management,
+safety guarantees, testing (unit + on-target integration + simulated
+attack lab commands with expected outcomes), resource consumption,
+troubleshooting table, uninstallation, documentation index, branch
+policy. Evidence: rendered review.
+
 2026-10-15 — **T-19** (closure) —
-All tasks T-0…T-19 closed; problems P-1…P-12 FIXED, P-13…P-15
-documented limitations; unknowns U-1…U-5 carry next steps. Final push
-to `main` on github.com/Vtheonly/NetFend.
+What: final verification pass. Full suite `python3 -m pytest tests/ -q`
+→ **95 passed**; `python3 -m py_compile` across all modules OK; CLI
+`--doctor`/`--status` verified in sandbox (degraded mode with honest
+capability warnings); dashboard E2E auth matrix verified live (static,
+7 API endpoints, 401/401/403/200 auth chain, traversal 404, unknown
+actions 404, invalid args 400); `bash -n` on all shell scripts OK.
+Docs closed: task registry T-0…T-19 all DONE with evidence; problems
+P-1…P-12, P-16, P-17 FIXED; P-13…P-15 documented limitations; U-1…U-5
+carry next steps. All commits pushed to `main` on
+github.com/Vtheonly/NetFend (single-branch policy per AGENTS.md §6).

@@ -104,6 +104,16 @@ The next agent must not have to rediscover the same problem.
 
 ## 5. Known Traps (do not reintroduce)
 
+- `threading.Lock` is NOT reentrant: never call a method that acquires
+  the same lock while already holding it. Found as a real deadlock in
+  `DeviceRegistry.forget()` (calling `save()` inside the lock) on
+  2026-10-15 — the test suite hung because of it. If a method must
+  both mutate under lock and persist, do the mutation under the lock,
+  then call `save()` AFTER releasing it.
+- Python's `str.capitalize()` lowercases every character after the
+  first — it destroyed "DNS" in a user-facing verdict string. Use
+  explicit casing, not `capitalize()`, for mixed technical strings.
+
 - `arptables` is legacy and often absent; even when present, flushing it
   globally destroys user rules. Use nftables `arp` family in our own table.
 - `ip neigh replace ... nud permanent` requires the interface to exist and

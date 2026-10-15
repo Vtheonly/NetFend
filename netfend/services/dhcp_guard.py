@@ -24,6 +24,7 @@ class DhcpEvaluator:
     def __init__(self):
         self.baseline_servers: Dict[str, Dict[str, Any]] = {}  # "ip|mac" -> info
         self.learn_observations = 2
+        self._observations_seen = 0   # total server messages during learning
         self.baseline_router: Optional[str] = None
         self.baseline_dns: List[str] = []
         self._last_rogue_emitted: Dict[str, float] = {}
@@ -34,15 +35,19 @@ class DhcpEvaluator:
             return events  # only server-originated messages indicate a server
         skey = f"{obs.get('server_ip')}|{obs.get('server_mac')}"
 
+        # Learning window counts OBSERVATIONS (not distinct servers), so a
+        # single server seen twice completes a learn_observations=2 window.
+        if self._observations_seen < self.learn_observations:
+            self._observations_seen += 1
+            self.baseline_servers.setdefault(skey, {
+                "server_ip": obs.get("server_ip"),
+                "server_mac": obs.get("server_mac"),
+                "first_seen": now,
+            })
+            self._update_option_baseline(obs)
+            return events
+
         if skey not in self.baseline_servers:
-            if len(self.baseline_servers) < self.learn_observations:
-                # Learning window: assume legitimate
-                self.baseline_servers[skey] = {
-                    "server_ip": obs.get("server_ip"),
-                    "server_mac": obs.get("server_mac"),
-                    "first_seen": now,
-                }
-                return events
             # Known servers exist and this is a NEW server => rogue candidate
             if self._cooldown_ok(skey, now, 300):
                 events.append({
@@ -81,11 +86,15 @@ class DhcpEvaluator:
                     "confidence": "unverified",
                     "summary": f"DHCP-provided DNS servers changed to {dns}",
                     "evidence": {"old": self.baseline_dns, "new": dns}})
-        if router:
-            self.baseline_router = router
-        if dns:
-            self.baseline_dns = dns
+        self._update_option_baseline(obs)
         return events
+
+    def _update_option_baseline(self, obs: Dict[str, Any]) -> None:
+        opts = obs.get("options") or {}
+        if opts.get("router"):
+            self.baseline_router = opts["router"]
+        if opts.get("dns"):
+            self.baseline_dns = list(opts["dns"])
 
     def _cooldown_ok(self, key: str, now: float, cooldown: float) -> bool:
         if now - self._last_rogue_emitted.get(key, 0.0) >= cooldown:

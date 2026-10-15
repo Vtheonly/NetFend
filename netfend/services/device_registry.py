@@ -106,7 +106,8 @@ class DeviceRegistry:
     def forget(self, mac: str) -> bool:
         mac = mac.lower()
         with self._lock:
-            if mac in self.devices:
+            existed = mac in self.devices
+            if existed:
                 del self.devices[mac]
-                return self.save()
-        return False
+        # save() takes the lock itself — must NOT be called while holding it
+        return self.save() if existed else False
