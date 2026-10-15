@@ -116,7 +116,10 @@ DEFAULTS: Dict[str, Any] = {
         "oscillation_min_transitions": 6,  # switches in window => oscillation, not change
         "corrective_arp_max": 5,        # bounded, event-triggered only (ADR-002/006)
         "corrective_arp_enabled": True,
-        "corrective_arp_cooldown_s": 60,
+        "corrective_arp_cooldown_s": 60,    # sporadic attacks: one burst per window
+        "corrective_sustain_window_s": 12,  # triggers this close together = sustained attack (P-28)
+        "corrective_sustain_interval_s": 5, # ... allow a burst this often while sustained
+        "corrective_packets_per_minute": 30,  # sliding 60s airtime budget (hard ceiling 60)
     },
     "dhcp": {
         "enabled": True,

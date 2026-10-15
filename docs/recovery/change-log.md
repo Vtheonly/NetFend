@@ -285,3 +285,20 @@ router admin page); re-run the engine once so the new
 `firewall.validation_failed`/`firewall.fallback` events capture the
 exact nft stderr for the primary ruleset hardening; enable 802.11w/PMF
 on the router to close the deauth vector at -81 dBm signal strength.
+
+2026-10-16 — **T-29** (sustained-attack corrective defense, P-28) —
+What: active_defense.py gained sustained-attack semantics: attack
+pressure tracking (fresh trigger inside 12 s window → sustained mode),
+5 s inter-burst interval while sustained (60 s cooldown otherwise),
+sliding 60 s packet budget (default 30, hard ceiling 60 — config-typo
+proof), kernel re-pin moved OUT of the cooldown gate (zero-packet action
+now happens on every confirmed spoof), `arp.gateway_oscillation`
+(poison fight) added as a trigger kind, and unicast ARP re-assertion to
+the gateway added alongside the broadcast GARP (the NetCut primitive
+poisons the gateway's cache about the victim — unicast heals exactly
+that cache). Why: under continuous re-poisoning the old fixed cooldown
+silenced the defense for ~59 of every 60 s, recreating the "legacy
+engine works better" gap while staying within ADR-001/002 bounds.
+Evidence: tests/test_active_defense.py 7→16 tests, all green; ADR-006
+amendment documents the invariants (worst case ~0.5–1 pkt/s under
+maximum sustained pressure, zero when the attack stops).

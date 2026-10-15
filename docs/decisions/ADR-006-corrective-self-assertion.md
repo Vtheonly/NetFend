@@ -44,3 +44,36 @@ Defense actions are visible as `defense.corrective_action` events and in
 the dashboard's Local Network Attack Protection panel. The engine remains
 idle-silent in steady state; an attacker who stops attacking stops the
 response.
+
+---
+
+**Amendment (2026-10-16, P-28): sustained-attack mode.**
+
+Field reality: attackers with bettercap/NetCut re-poison every 1–2 s. A
+fixed 60 s cooldown meant one corrective burst followed by almost a
+minute of silence while under continuous attack — precisely the window
+in which the legacy engine "worked better". The amendment keeps every
+invariant above and adds:
+
+1. **Sustained mode** — a trigger arriving within
+   `arp.corrective_sustain_window_s` (default 12 s) of the previous one
+   marks the attack as sustained; the inter-burst interval then drops
+   from the normal cooldown (60 s) to
+   `arp.corrective_sustain_interval_s` (default 5 s). No timer, ever:
+   bursts still fire only when fresh trigger evidence arrives.
+2. **Airtime budget** — a sliding 60 s packet budget
+   (`arp.corrective_packets_per_minute`, default 30, hard ceiling 60
+   regardless of config) caps total corrective traffic even under
+   maximum sustained pressure. Budget exhaustion skips the packet burst
+   but never the (zero-packet) kernel re-pin.
+3. **`arp.gateway_oscillation`** (a poison/anti-poison MAC trade-war)
+   is now a trigger kind — a sustained fight is an active attack.
+4. **Gateway unicast** — each burst now also sends up to `count` UNICAST
+   replies to the gateway healing its cache about us (the exact cache
+   NetCut poisons), in addition to the broadcast GARP healing the LAN.
+   Still only our own identity (ADR-001).
+
+Net effect: worst-case corrective traffic is ~0.5–1 packet/s under
+continuous attack (budget-capped), and zero the moment the attack
+stops. Evidence: `tests/test_active_defense.py` (sustained-mode,
+interval, budget, re-pin-not-gated, unicast tests).
