@@ -39,7 +39,7 @@ class DefenseEngine:
                  events: EventStore = None, dashboard=None):
         self.nm = NetworkManager(interface=interface)
         self.events = events or EventStore()
-        self.intel = ThreatIntelligence()
+        self.intel = ThreatIntelligence(events=self.events)
         self.registry = DeviceRegistry()
         self.firewall = FirewallManager(self.nm, self.events)
         self.active_defense = ActiveDefense(self.nm, self.events, self.intel)

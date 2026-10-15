@@ -35,6 +35,37 @@ class ThreatProfile:
         except (ValueError, TypeError):
             return 0.0
 
+    def timing_stats(self) -> Optional[Dict[str, float]]:
+        """Mean / stddev / count of recent burst intervals.
+
+        Input for fuzzy MAC-rotation correlation (P-29): an attacker's
+        tool has a characteristic cadence (bettercap's spoof interval,
+        NetCut's re-poison rate). Exact-hash fingerprints (below) miss
+        the match when quantization drifts; comparing the raw stats with
+        tolerance catches it.
+        """
+        ivs = self.burst_intervals[-50:]
+        if len(ivs) < 5:
+            return None
+        mean = sum(ivs) / len(ivs)
+        var = sum((x - mean) ** 2 for x in ivs) / len(ivs)
+        return {"mean": mean, "stddev": math.sqrt(var), "n": len(ivs)}
+
+    def is_locally_administered(self) -> bool:
+        """True when the locally-administered bit is set (second hex
+        digit in {2, 6, a, e}).
+
+        MAC-rotation attackers MUST use locally-administered addresses
+        (real vendor OUIs would collide / not be rotatable). Caveat:
+        modern phone privacy randomization produces the same bit — this
+        is a correlation signal, never proof of hostility (AGENTS.md
+        rule 7).
+        """
+        try:
+            return bool(int(self.mac[1], 16) & 0b10)
+        except (ValueError, IndexError):
+            return False
+
     def effective_level(self, now: Optional[datetime] = None) -> str:
         """Stored threat level decayed by inactivity.
 
@@ -125,6 +156,10 @@ class ThreatProfile:
         Generate a behavioral fingerprint based on attack timing patterns.
         Even if the attacker changes their MAC, their tool's timing signature
         remains consistent. This allows us to correlate new MACs to known attackers.
+
+        The exact hash is intentionally strict (quantized to 2 decimals); the
+        fuzzy correlation in ThreatIntelligence.correlate() covers the cases
+        where quantization drift breaks an exact match (P-29).
         """
         if len(self.burst_intervals) < 5:
             return None

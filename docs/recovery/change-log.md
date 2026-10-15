@@ -302,3 +302,19 @@ engine works better" gap while staying within ADR-001/002 bounds.
 Evidence: tests/test_active_defense.py 7→16 tests, all green; ADR-006
 amendment documents the invariants (worst case ~0.5–1 pkt/s under
 maximum sustained pressure, zero when the attack stops).
+
+2026-10-16 — **T-30** (fuzzy MAC-rotation correlation, P-29) —
+What: ThreatProfile gained timing_stats() (raw mean/stddev/n) and
+is_locally_administered() (randomized-MAC bit). ThreatIntelligence
+gained correlate(): links profiles whose attack cadence matches within
+35% relative mean difference AND whose technique sets overlap (Jaccard
+>= 0.5) or who target the same spoofed IP; links are bidirectional,
+persisted in alias_map (blacklist.json), inherit the highest threat
+level across the group, and surface as intel.mac_rotation events
+(engine now wires events into ThreatIntelligence). summary()/CLI
+report flag randomized MACs and list aliases. Why: the exact-quantized
+fingerprint hash only matched bit-identical cadence; dedicated attack
+suites rotate MACs freely while their tool cadence and technique set
+stay constant — exactly what the correlator keys on. Evidence:
+tests/test_threat_intel.py (15 tests incl. non-correlation guards
+against different-cadence/different-tool profiles); suite 162 passing.
