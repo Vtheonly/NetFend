@@ -87,17 +87,30 @@ def build_param_list(rp_filter_mode: str = "strict") -> List[Tuple[str, str]]:
 
 
 class KernelHardener:
-    """Applies and restores engine-owned sysctl state."""
+    """Applies and restores engine-owned sysctl state.
+
+    Reused by the IPv6 RA guard (T-32) with its own parameter list,
+    event prefix, state file, and enable gate — one implementation of
+    the save/restore/crash-recovery contract (ADR-007).
+    """
 
     def __init__(self, events: EventStore,
                  proc_base: str = "/proc/sys",
-                 state_path: Optional[Path] = None):
+                 state_path: Optional[Path] = None,
+                 params: Optional[List[Tuple[str, str]]] = None,
+                 event_prefix: str = "hardening",
+                 enabled_gate=None,
+                 describe: str = "sysctl hardening set"):
         self.events = events
         self.proc_base = Path(proc_base)
         if state_path is None:
             from netfend.utils.config import DATA_DIR
             state_path = Path(DATA_DIR) / "hardening_state.json"
         self.state_path = Path(state_path)
+        self._custom_params = params
+        self._event_prefix = event_prefix
+        self._enabled_gate = enabled_gate
+        self._describe = describe
         self._lock = threading.Lock()
         self.applied: Dict[str, str] = {}       # path -> enforced value
         self.restored_once = False
@@ -108,7 +121,22 @@ class KernelHardener:
         return capabilities.have("root") and not cfg("general", "dry_run")
 
     def enabled(self) -> bool:
+        if self._enabled_gate is not None:
+            try:
+                return bool(self._enabled_gate())
+            except Exception:
+                return False
         return bool(cfg("hardening", "enabled", True))
+
+    def _param_list(self) -> List[Tuple[str, str]]:
+        if self._custom_params is not None:
+            return list(self._custom_params)
+        mode = str(cfg("hardening", "rp_filter", "strict"))
+        try:
+            return build_param_list(mode)
+        except ValueError as e:
+            log_warn(f"{e}; falling back to 'strict'")
+            return build_param_list("strict")
 
     # -- tiny /proc/sys IO ------------------------------------------------------
     def _proc_path(self, rel: str) -> Path:
@@ -159,21 +187,21 @@ class KernelHardener:
 
     # -- public API ---------------------------------------------------------------
     def apply(self) -> bool:
-        """Enforce the hardening set. Returns True when all params applied."""
+        """Enforce the parameter set. Returns True when all params applied."""
         with self._lock:
             if not self.enabled():
                 self.events.emit_simple(
-                    "hardening.disabled", "notice", "confirmed",
-                    "Kernel hardening disabled by config (hardening.enabled=false)",
-                    source="hardening")
+                    f"{self._event_prefix}.disabled", "notice", "confirmed",
+                    f"Kernel parameter enforcement disabled by config "
+                    f"({self._describe})",
+                    source=self._event_prefix)
                 return False
             if not self.available():
                 self.events.emit_simple(
-                    "hardening.unavailable", "notice", "unverified",
-                    "Kernel hardening unavailable "
-                    "(need root and dry_run off); ICMP redirect / "
-                    "source-route / rp_filter protections inactive",
-                    source="hardening")
+                    f"{self._event_prefix}.unavailable", "notice", "unverified",
+                    f"Kernel parameter enforcement unavailable "
+                    f"(need root and dry_run off); {self._describe} inactive",
+                    source=self._event_prefix)
                 return False
 
             # crash recovery: restore a stale state file first so the
@@ -183,12 +211,7 @@ class KernelHardener:
                 self._restore_dict(stale)
                 self._clear_state()
 
-            mode = str(cfg("hardening", "rp_filter", "strict"))
-            try:
-                params = build_param_list(mode)
-            except ValueError as e:
-                log_warn(f"{e}; falling back to 'strict'")
-                params = build_param_list("strict")
+            params = self._param_list()
 
             originals: Dict[str, str] = {}
             applied: List[str] = []
@@ -216,16 +239,15 @@ class KernelHardener:
                 self._save_state(originals)
             self.last_result = {
                 "applied": applied, "skipped": skipped, "failed": failed,
-                "rp_filter": mode}
+                "params": [rel for rel, _ in params]}
             ok = not failed
             level = "info" if ok else "warning"
             self.events.emit_simple(
-                "hardening.applied", level, "confirmed",
-                f"Kernel hardening applied: {len(applied)} parameter(s) "
-                f"enforced (ICMP redirects off, source-route off, rp_filter "
-                f"'{mode}')" + (f"; {len(failed)} failed" if failed else ""),
-                source="hardening", **self.last_result)
-            log_info(f"Kernel hardening: {len(applied)} applied, "
+                f"{self._event_prefix}.applied", level, "confirmed",
+                f"{self._describe}: {len(applied)} parameter(s) enforced"
+                + (f"; {len(failed)} failed" if failed else ""),
+                source=self._event_prefix, **self.last_result)
+            log_info(f"{self._event_prefix}: {len(applied)} applied, "
                      f"{len(skipped)} absent, {len(failed)} failed")
             return ok
 
@@ -243,11 +265,11 @@ class KernelHardener:
             self.applied = {}
             self.restored_once = True
             self.events.emit_simple(
-                "hardening.restored", "info", "confirmed",
+                f"{self._event_prefix}.restored", "info", "confirmed",
                 f"Kernel parameters restored to pre-engine values "
                 f"({len(state)} parameter(s))",
-                source="hardening", restored=sorted(state))
-            log_info(f"Kernel hardening restored ({len(state)} params)")
+                source=self._event_prefix, restored=sorted(state))
+            log_info(f"{self._event_prefix} restored ({len(state)} params)")
 
     def _restore_dict(self, state: Dict[str, str]) -> None:
         for rel, value in state.items():
@@ -268,6 +290,7 @@ class KernelHardener:
                 "active": bool(state) or bool(self.applied),
                 "enforced": sorted(self.applied) or sorted(state),
                 "restored_once": self.restored_once,
+                "describe": self._describe,
                 "rp_filter_mode": str(cfg("hardening", "rp_filter", "strict")),
                 "restore_on_stop": bool(cfg("hardening", "restore_on_stop", True)),
                 "last_result": self.last_result,

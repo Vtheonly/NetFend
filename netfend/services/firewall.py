@@ -55,12 +55,19 @@ _ERR_EXCERPT = 200
 def build_filter_ruleset(profile: str, new_conn_rate: int, new_conn_burst: int,
                          icmp_rate: int, icmp_burst: int,
                          strict_tcp_ports: List[int], strict_udp_ports: List[int],
-                         icmpv6: bool = True) -> str:
+                         icmpv6: bool = True, ra_guard: bool = False) -> str:
     """Generate the full `inet netfend_filter` ruleset text (candidate #1).
 
     Uses meters (dynamic per-source sets) — the most capable variant, but
     also the one most likely to be rejected by old nft versions, which is
     why `build_basic_filter_ruleset` exists as fallback.
+
+    L3-metadata attack drops (T-32 / ADR-008): ICMP redirects (v4+v6)
+    are ALWAYS dropped here — they are the gateway-grade route-hijack
+    vector and never legitimate for this client (sysctl also disables
+    them; the nft drop is line-rate belt-and-braces). When `ra_guard`
+    is true (engine decided the network is v4-only), ICMPv6 router
+    advertisements are dropped too — the mitm6/rogue-RA takeover.
     """
     if profile not in ("standard", "strict"):
         raise ValueError(f"unknown firewall profile: {profile}")
@@ -77,6 +84,9 @@ def build_filter_ruleset(profile: str, new_conn_rate: int, new_conn_burst: int,
         "    iifname \"lo\" accept comment \"netfend: loopback\"",
         "    ct state established,related accept comment \"netfend: established and related\"",
         "    ct state invalid drop comment \"netfend: invalid state\"",
+        "    # L3-metadata attack drops (redirects never legitimate for a client)",
+        "    ip protocol icmp icmp type redirect counter drop comment \"netfend: icmp redirect drop\"",
+        "    ip6 nexthdr ipv6-icmp icmpv6 type nd-redirect counter drop comment \"netfend: icmpv6 redirect drop\"",
         "    # Per-source NEW connection rate limit (scan / SYN-flood resistance)",
         f"    tcp flags & (fin | syn | rst | ack) == syn ct state new meter netfend_synflood {{ ip saddr timeout 30s limit rate over {new_conn_rate}/second burst {new_conn_burst} packets }} counter drop comment \"netfend: syn flood per source\"",
         f"    meta l4proto udp ct state new meter netfend_udpflood {{ ip saddr timeout 30s limit rate over {new_conn_rate}/second burst {new_conn_burst} packets }} counter drop comment \"netfend: udp flood per source\"",
@@ -86,6 +96,9 @@ def build_filter_ruleset(profile: str, new_conn_rate: int, new_conn_burst: int,
     if icmpv6:
         lines.append(
             f"    ip6 nexthdr ipv6-icmp icmpv6 type echo-request limit rate over {icmp_rate}/second burst {icmp_burst} packets counter drop comment \"netfend: icmp6 echo flood\"")
+    if ra_guard:
+        lines.append(
+            "    ip6 nexthdr ipv6-icmp icmpv6 type nd-router-advert counter drop comment \"netfend: rogue RA guard (mitm6)\"")
     if profile == "strict":
         # Essentials that must stay reachable even in default-drop
         lines += [
@@ -107,11 +120,12 @@ def build_filter_ruleset(profile: str, new_conn_rate: int, new_conn_burst: int,
 
 
 def build_basic_filter_ruleset(profile: str, icmp_rate: int, icmp_burst: int,
-                               icmpv6: bool = True) -> str:
+                               icmpv6: bool = True, ra_guard: bool = False) -> str:
     """Candidate #2: no meters (per-source sets) — works on older nft.
 
     Global (not per-source) rate limits. Weaker against distributed floods
-    but preserves the essential drops.
+    but preserves the essential drops (invalid state, redirects, and the
+    RA drop when the guard is active).
     """
     if profile not in ("standard", "strict"):
         raise ValueError(f"unknown firewall profile: {profile}")
@@ -125,10 +139,16 @@ def build_basic_filter_ruleset(profile: str, icmp_rate: int, icmp_burst: int,
         "    iifname \"lo\" accept comment \"netfend: loopback\"",
         "    ct state established,related accept comment \"netfend: established and related\"",
         "    ct state invalid drop comment \"netfend: invalid state\"",
+        "    # L3-metadata attack drops (kept in the compatibility variant)",
+        "    ip protocol icmp icmp type redirect counter drop comment \"netfend: icmp redirect drop\"",
+        "    ip6 nexthdr ipv6-icmp icmpv6 type nd-redirect counter drop comment \"netfend: icmpv6 redirect drop\"",
         "    # Global NEW-connection rate limit (compatibility fallback, no per-source sets)",
         "    ct state new limit rate over 200/second burst 400 packets counter drop comment \"netfend: conn flood\"",
         f"    ip protocol icmp icmp type echo-request limit rate over {icmp_rate}/second burst {icmp_burst} packets counter drop comment \"netfend: icmp4 echo flood\"",
     ]
+    if ra_guard:
+        lines.append(
+            "    ip6 nexthdr ipv6-icmp icmpv6 type nd-router-advert counter drop comment \"netfend: rogue RA guard (mitm6)\"")
     if icmpv6:
         lines.append(
             f"    ip6 nexthdr ipv6-icmp icmpv6 type echo-request limit rate over {icmp_rate}/second burst {icmp_burst} packets counter drop comment \"netfend: icmp6 echo flood\"")
@@ -306,12 +326,16 @@ class FirewallManager:
         }
 
     # -- application ----------------------------------------------------------
-    def apply(self, interface: str = None) -> bool:
+    def apply(self, interface: str = None, ra_guard: bool = False) -> bool:
         """Validate + apply rulesets. Returns True when rules are active.
 
         Tables are applied INDEPENDENTLY (P-18): a rejected filter ruleset
         never blocks the ARP table, and each table falls back to a simpler
         candidate when the richer one is rejected by the local nft.
+
+        `ra_guard` (from Ipv6Guard, T-32) adds the ICMPv6 RA drop to the
+        filter ruleset — active only when the engine determined the
+        network is v4-only, so legitimate IPv6 is never broken.
         """
         if not self.available():
             reason = ("dry-run mode" if cfg("general", "dry_run")
@@ -379,11 +403,13 @@ class FirewallManager:
                 cfg("firewall", "icmp_rate_per_s", 20),
                 cfg("firewall", "icmp_burst", 40),
                 cfg("firewall", "strict_allowed_tcp_ports", []),
-                cfg("firewall", "strict_allowed_udp_ports", [53, 67, 68]))),
+                cfg("firewall", "strict_allowed_udp_ports", [53, 67, 68]),
+                ra_guard=ra_guard)),
             ("basic", build_basic_filter_ruleset(
                 self.profile,
                 cfg("firewall", "icmp_rate_per_s", 20),
-                cfg("firewall", "icmp_burst", 40))),
+                cfg("firewall", "icmp_burst", 40),
+                ra_guard=ra_guard)),
             ("minimal", build_minimal_filter_ruleset(self.profile)),
         ]
         filter_ok, filter_err = self._apply_first_valid(filter_candidates, "filter")

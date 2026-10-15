@@ -339,3 +339,24 @@ _deep_merge shared nested dicts with DEFAULTS so runtime set_config()
 overrides survived config reloads; fixed with a recursive copy.
 Evidence: tests/test_hardening.py (16 tests incl. crash recovery and
 gates), TestConfigNoDefaultsPollution regressions; suite 180 passing.
+
+2026-10-16 — **T-32** (IPv6 RA guard, P-32) —
+What: new `netfend/services/ipv6_guard.py` (ADR-008). Auto mode: when
+no IPv6 default route exists (typical v4-only home LAN), suppress RAs
+at two layers — sysctl accept_ra=0 (all/default/iface, KernelHardener
+save/restore contract with dedicated ipv6_state.json) + nftables
+`icmpv6 type nd-router-advert drop` in netfend_filter. When IPv6 IS
+in use, monitor instead: >1 distinct RA source in the window emits
+critical `ipv6.ra_conflict` (mitm6 signature) and feeds threat intel
+with the sender MAC. Unknown routing state (ip -6 unreadable) never
+suppresses (fail-open for connectivity); `ipv6.ra_guard=on` forces.
+Firewall full+basic variants now ALWAYS drop ICMP redirects (v4
+`redirect`, v6 `nd-redirect` — gateway-grade route-hijack vector,
+never legitimate for a client), and the RA drop is ordered before the
+strict profile's blanket icmpv6 accept. KernelHardener generalized
+(custom params/event-prefix/enable-gate/description) so the IPv6 guard
+reuses one implementation of the ADR-007 contract. Engine applies the
+guard decision before building the firewall ruleset and starts the RA
+sniffer with the other guards. Why: attackers pivot to IPv6 when IPv4
+is defended (mitm6); the previous engine had zero IPv6 coverage.
+Evidence: tests/test_ipv6_guard.py (18 tests); suite 200 passing.

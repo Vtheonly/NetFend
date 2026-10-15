@@ -24,6 +24,7 @@ from netfend.services.dhcp_guard import DhcpGuard
 from netfend.services.dns_guard import DnsGuard
 from netfend.services.firewall import FirewallManager
 from netfend.services.hardening import KernelHardener
+from netfend.services.ipv6_guard import Ipv6Guard
 from netfend.services.metrics import MetricsCollector
 from netfend.services.network_manager import NetworkManager
 from netfend.services.threat_intelligence import ThreatIntelligence
@@ -44,6 +45,7 @@ class DefenseEngine:
         self.registry = DeviceRegistry()
         self.firewall = FirewallManager(self.nm, self.events)
         self.hardener = KernelHardener(self.events)
+        self.ipv6_guard = Ipv6Guard(self.nm, self.events, self.intel)
         self.active_defense = ActiveDefense(self.nm, self.events, self.intel)
         self.arp_guard = ArpGuard(self.nm, self.events, self.registry, self.intel,
                                   on_gateway_rebaseline=self._on_gateway_rebaseline,
@@ -95,6 +97,7 @@ class DefenseEngine:
         self.dns_guard.start()
         self.wifi.start()
         self.metrics.start()
+        self.ipv6_guard.start()   # RA conflict detection (mitm6)
 
         # Network change monitoring
         if cfg("network_monitor", "enabled", True):
@@ -131,8 +134,12 @@ class DefenseEngine:
         # 2) sysctl hardening (redirects, source-route, rp_filter) — T-31
         self.hardener.apply()
 
-        # 3) nftables enforcement (validates + self-checks + rolls back)
-        self.firewall.apply()
+        # 3) IPv6 RA guard decision (before the firewall build: the filter
+        #    ruleset takes the RA drop only when suppression is active)
+        ra_guard = self.ipv6_guard.evaluate_and_enforce()
+
+        # 4) nftables enforcement (validates + self-checks + rolls back)
+        self.firewall.apply(ra_guard=ra_guard)
 
     def _on_gateway_rebaseline(self, gw_ip: str, new_mac: str) -> None:
         """P-19 feedback loop: the ARP guard accepted a legitimate gateway
@@ -236,7 +243,7 @@ class DefenseEngine:
 
         # Stop guards (each cleans up its own resources)
         for guard in (self.arp_guard, self.dhcp_guard, self.dns_guard,
-                      self.wifi, self.metrics):
+                      self.wifi, self.metrics, self.ipv6_guard):
             try:
                 guard.stop()
             except Exception as e:
@@ -311,6 +318,8 @@ class DefenseEngine:
             "identity": self.nm.snapshot(),
             "capabilities": capabilities.summary(),
             "firewall": self.firewall.status(),
+            "hardening": self.hardener.status(),
+            "ipv6": self.ipv6_guard.status(),
             "arp": {"active": self.arp_guard.evaluator is not None,
                     "available": self.arp_guard.available()},
             "active_defense": self.active_defense.status(),

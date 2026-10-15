@@ -165,6 +165,17 @@ class NetworkManager:
             return None
         return parse_default_route(out)
 
+    def has_ipv6_default_route(self) -> Optional[bool]:
+        """True when an IPv6 default route exists (RA/SLAAC or DHCPv6).
+
+        Returns None when the routing table cannot be read (ip -6
+        unavailable) — callers must treat None as 'unknown, do not
+        suppress' (Ipv6Guard, T-32)."""
+        out = _run(["ip", "-6", "route"])
+        if out is None:
+            return None
+        return parse_default_route(out) is not None
+
     def refresh(self) -> bool:
         """Re-read identity from the system. Returns True when usable."""
         route = self._detect_default_route()

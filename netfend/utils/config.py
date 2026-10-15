@@ -107,6 +107,14 @@ DEFAULTS: Dict[str, Any] = {
         "rp_filter": "strict",          # strict (1) | loose (2) | preserve — see ADR-007
         "restore_on_stop": True,        # restore pre-engine values on engine stop
     },
+    "ipv6": {
+        "enabled": True,                # RA guard module (mitm6 vector)
+        "ra_guard": "auto",             # auto (suppress only when v4-only) | on | off
+        "detect_ra_conflicts": True,    # sniffer: >1 distinct RA source => critical event
+        "ra_conflict_window_s": 60,     # RA source memory window
+        "ra_conflict_max_sources": 1,   # distinct sources allowed before conflict
+        "ra_conflict_cooldown_s": 300,  # min spacing between conflict events
+    },
     "arp": {
         "enabled": True,
         "flap_window_s": 120,           # same IP seen with N distinct MACs within window
