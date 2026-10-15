@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime data / logs (never commit runtime state)
+data/
+*.log
+*.jsonl
+
+# Local dev
+.env
+*.swp
+.idea/
+.vscode/
+
+# Never commit secrets or tokens
+*token*
+*.secret

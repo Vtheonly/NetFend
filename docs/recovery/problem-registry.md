@@ -1,0 +1,21 @@
+# Problem Registry
+
+Legend: `OPEN` · `FIXED` (fix verified) · `MITIGATED` (risk reduced, residual documented) · `WONTFIX` (rationale given)
+
+| ID | Severity | Status | Problem | Root cause (audit RC) | Fixed in / notes |
+|----|----------|--------|---------|------------------------|------------------|
+| P-1 | Critical | FIXED | Engine permanently injects ARP "restoration blasts" (up to 600 pps), consuming Wi-Fi airtime and slowing the owner's connection | RC-1 | ADR-002; mitigation loop removed entirely. Verified: no timed senders in code; unit test `test_engine_safety.py::test_no_periodic_send` asserts no `sendp`/`send` in steady-state paths |
+| P-2 | Critical | FIXED | Engine ARP-poisons every device not explicitly authorized; new legitimate devices are cut off the network | RC-2 | ADR-001; `_mitigate_unauthorized_devices` removed. Device registry retained for observation only |
+| P-3 | High | FIXED | /24 ARP sweep every 30 s floods the LAN and burns airtime | RC-3 | Discovery is now passive (neighbor table + observed ARP senders); active scan is on-demand only (`netfend scan`) |
+| P-4 | High | FIXED | `arptables -F` flushes global state; no IP firewall exists | RC-4 | ADR-003; engine-owned nftables tables with `nft -c` validation + connectivity self-check + rollback |
+| P-5 | High | FIXED | Network identity captured once; stale identity after DHCP/roam/VPN makes enforcement wrong and generates false spoof alerts | RC-5 | ADR-005; `ip monitor` event-driven re-baselining, gateway-change confidence workflow |
+| P-6 | High | FIXED | No persistence; `pkill` leaves static ARP entries and arp rules behind after death | RC-6 | systemd unit + signal handlers + `ExecStopPost` cleanup; installer/uninstaller |
+| P-7 | High | FIXED | `net_reset` bounces the interface, destroying Wi-Fi association (owner's "Wi-Fi hard to connect" symptom) | RC-7 | Interface bouncing removed from all paths; recovery = neighbor cleanup + engine-owned table removal |
+| P-8 | Medium | FIXED | Own-IP arptables rule blocks legitimate ARP (DAD probes) and goes stale after IP change | RC-8 | arp rule keys on sender MAC ≠ own MAC; rebuilt on network change |
+| P-9 | Medium | FIXED | Registry JSON rewritten on every sniffed ARP packet (disk churn, lock contention, self-observation loop) | RC-9 | Debounced saves; own transmissions ignored; sniffing limited to BPF-filtered ARP+DHCP |
+| P-10 | High | FIXED | No detection for DNS manipulation, rogue DHCP, deauth patterns, IP-MAC flapping, floods, throughput/latency health | RC-10 | Guards: arp, dhcp, dns, wifi, flood/health metrics; severity+confidence events; documented hardware limits |
+| P-11 | Medium | FIXED | Committed `__pycache__`, no .gitignore, no README/tests/docs, unbounded log growth, package installed into /usr/local/bin, no uninstaller | RC-11 | Hygiene commit, RotatingFileHandler, /opt install layout + uninstall.sh |
+| P-12 | Medium | FIXED | Startup dies if gateway MAC can't be resolved quickly; blocking 6–8 s scans at boot | RC-12 | Engine starts degraded with `resolve_retries` in background; capability warnings instead of RuntimeError |
+| P-13 | Low | WONTFIX | Client-side tools cannot disconnect an attacker from the shared Wi-Fi medium | Physical limitation | Documented in README threat model + dashboard capability panel; router/AP-level controls recommended (802.11w, client isolation) |
+| P-14 | Low | OPEN | Deauth/disassociation detection requires monitor-mode or driver event support that most client adapters lack | RC-10 | Partial: Wi-Fi state transition classifier detects *effects* (repeated disconnects, reason codes when exposed); reliable frame-level detection marked unavailable unless `iw phy` advertises monitor caps — see unknowns U-2 |
+| P-15 | Low | OPEN | nftables rate limiting protects the host CPU but cannot stop airtime exhaustion from a Wi-Fi flooder on the same channel | Physical limitation | Documented; detection via packet-rate anomalies informs the user; real mitigation is router-side |
