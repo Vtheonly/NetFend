@@ -1,237 +1,294 @@
-import time
+"""DefenseEngine — orchestrator of the NetFend defense (event-driven rewrite).
+
+What changed vs. the legacy engine (audit RC-1/2/5/6, ADR-001/002/005):
+- NO periodic packet transmission of any kind (idle-silent defense)
+- NO attacking of other devices (unauthorized-device poisoning removed)
+- network-change aware: `ip monitor` subprocess (link/addr/route/neigh)
+  triggers re-baselining + rule re-application
+- degraded-mode startup: missing capabilities produce WARNING events,
+  never a crash (audit RC-12)
+- all threads daemon + Event-interruptible: clean systemd stop < 2 s
+- optional sd_notify watchdog when running under systemd
+"""
+import signal
+import subprocess
 import threading
-from typing import Optional, Dict, Any
-from scapy.all import Ether, ARP, sendp, sniff
-from netfend.utils.config import THREAT_MONITOR, THREAT_HIERARCHY, COUNTERMEASURE_PROFILE
-from netfend.utils.logging import log_info, log_warn, log_err, log_success
+import time
+from typing import Any, Dict, Optional
+
+from netfend.models.events import EventStore
+from netfend.services.arp_guard import ArpGuard
+from netfend.services.device_registry import DeviceRegistry
+from netfend.services.dhcp_guard import DhcpGuard
+from netfend.services.dns_guard import DnsGuard
+from netfend.services.firewall import FirewallManager
+from netfend.services.metrics import MetricsCollector
 from netfend.services.network_manager import NetworkManager
 from netfend.services.threat_intelligence import ThreatIntelligence
-from netfend.services.device_registry import DeviceRegistry
+from netfend.services.wifi_diagnostics import WifiDiagnostics
+from netfend.utils import capabilities
+from netfend.utils.config import cfg
+from netfend.utils.logging import log_info, log_warn, log_err, log_success
+
 
 class DefenseEngine:
-    """Core defender orchestrating network monitoring, packet analysis, active ARP blast mitigation, and blocking unauthorized hosts."""
+    """Core orchestrator. Owns all guards; owns no kernel state directly."""
 
-    def __init__(self, network_mgr: NetworkManager, intel: ThreatIntelligence, registry: DeviceRegistry):
-        self.nm = network_mgr
-        self.intel = intel
-        self.registry = registry
-
-        self.my_ip = self.nm.get_my_ip()
-        self.my_mac = self.nm.get_my_mac()
-        self.gw_ip = self.nm.detect_gateway_ip()
-        self.gw_mac = self.nm.resolve_mac(self.gw_ip)
+    def __init__(self, interface: Optional[str] = None,
+                 events: EventStore = None, dashboard=None):
+        self.nm = NetworkManager(interface=interface)
+        self.events = events or EventStore()
+        self.intel = ThreatIntelligence()
+        self.registry = DeviceRegistry()
+        self.firewall = FirewallManager(self.nm, self.events)
+        self.arp_guard = ArpGuard(self.nm, self.events, self.registry, self.intel)
+        self.dhcp_guard = DhcpGuard(self.nm, self.events)
+        self.dns_guard = DnsGuard(self.nm, self.events)
+        self.wifi = WifiDiagnostics(self.nm, self.events)
+        self.metrics = MetricsCollector(self.nm, self.events)
+        self.dashboard = dashboard
 
         self.running = False
-        self.mitigation_thread: Optional[threading.Thread] = None
-        self.status_thread: Optional[threading.Thread] = None
-        self.discovery_thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._monitor_proc: Optional[subprocess.Popen] = None
+        self.started_at: Optional[float] = None
+        self._rebaseline_lock = threading.Lock()
+        self._last_rebaseline = 0.0
 
-        self._active_threat_level = THREAT_MONITOR
-        self._active_threat_lock = threading.Lock()
+    # ------------------------------------------------------------------ start
+    def start(self) -> bool:
+        if self.running:
+            return True
+        caps = capabilities.probe()
+        self.events.emit_simple(
+            "engine.start", "info", "confirmed",
+            f"NetFend engine starting (dry_run={cfg('general', 'dry_run')})",
+            source="engine", capabilities=caps)
+        for note in capabilities.summary()["notes"]:
+            self.events.emit_simple("engine.capability", "warning",
+                                    "unverified", note, source="engine")
 
-        if not all([self.my_ip, self.my_mac, self.gw_ip, self.gw_mac]):
-            log_err("Could not initialize all network variables. Ensure connectivity.")
-            raise RuntimeError("Missing networking parameters")
+        self.running = True
+        self.started_at = time.time()
+        self._stop.clear()
 
-    def _update_active_threat(self, level: str):
-        with self._active_threat_lock:
+        snap = self.nm.refresh()
+        if not snap:
+            log_warn("Network identity incomplete at start — starting degraded; "
+                     "waiting for network-change events")
+
+        # Kernel-resident protection first (idle-silent: ADR-002)
+        self._apply_protections()
+        if not self.nm.gw_mac:
+            self.nm.resolve_mac_background()
+
+        # Guards
+        self.arp_guard.start()
+        self.dhcp_guard.start()
+        self.dns_guard.start()
+        self.wifi.start()
+        self.metrics.start()
+
+        # Network change monitoring
+        if cfg("network_monitor", "enabled", True):
+            self._start_netlink_monitor()
+
+        # Dashboard (started by engine when embedded)
+        if self.dashboard is not None:
+            self.dashboard.start()
+
+        self._install_signal_handlers()
+        try:
+            from netfend.utils.sd_notify import notify_ready
+            notify_ready()
+        except Exception:
+            pass
+        log_info("Defense engine active (idle-silent mode; zero steady-state packets)")
+        return True
+
+    # ------------------------------------------------------- kernel protection
+    def _apply_protections(self) -> None:
+        """Static gateway pin + firewall (both validated, rollback-safe)."""
+        snap = self.nm.snapshot()
+        gw_ip, gw_mac = snap["gateway_ip"], snap["gateway_mac"]
+
+        # 1) Static neighbor entry protects THIS host's gateway path.
+        if gw_ip and gw_mac and not cfg("general", "dry_run"):
+            if capabilities.have("root") and capabilities.have("ip"):
+                if self.nm.set_static_neighbor(gw_ip, gw_mac):
+                    log_info(f"Gateway pinned in kernel neighbor table: {gw_ip} -> {gw_mac}")
+                else:
+                    log_warn("Could not pin gateway neighbor entry (check privileges)")
+
+        # 2) nftables enforcement (validates + self-checks + rolls back)
+        self.firewall.apply()
+
+    # ------------------------------------------------------ network monitoring
+    def _start_netlink_monitor(self):
+        if not capabilities.have("ip"):
+            self.events.emit_simple(
+                "monitor.unavailable", "warning", "unverified",
+                "Network change monitoring unavailable (iproute2 missing)",
+                source="engine")
+            return
+
+        def _reader():
             try:
-                cur_idx = THREAT_HIERARCHY.index(self._active_threat_level)
-                new_idx = THREAT_HIERARCHY.index(level)
-                if new_idx > cur_idx:
-                    self._active_threat_level = level
-            except ValueError:
+                self._monitor_proc = subprocess.Popen(
+                    ["ip", "monitor", "link", "addr", "route", "neigh"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            except OSError as e:
+                log_warn(f"Could not start ip monitor: {e}")
+                return
+            log_info("Network change monitor active (netlink)")
+            last_event = 0.0
+            for line in self._monitor_proc.stdout:
+                if self._stop.is_set():
+                    break
+                line = line.strip()
+                if not line or line.startswith(("Deleted", "prefix")) and "]" not in line:
+                    # Heuristic filter: only act on substantial lines
+                    pass
+                now = time.time()
+                # Debounce bursts of netlink events (one re-baseline per burst)
+                if line and now - last_event >= 1.0:
+                    last_event = now
+                    settle = cfg("network_monitor", "settle_delay_s", 3)
+                    if self._stop.wait(settle):
+                        break
+                    self._on_network_change(line)
+            try:
+                self._monitor_proc.terminate()
+            except OSError:
                 pass
 
-    def _active_mitigation_loop(self):
-        """Active mitigation loop that counters spoofers by sending legitimate gateway mappings."""
-        log_info("Active mitigation thread initialized. Monitoring gateway spoofing...")
-        
-        # Craft safe template frames pointing to accurate gateway mapping
-        pkt_to_gw = (Ether(dst=self.gw_mac, src=self.my_mac) /
-                     ARP(op=2, psrc=self.my_ip, hwsrc=self.my_mac,
-                         pdst=self.gw_ip, hwdst=self.gw_mac))
+        self._monitor_thread = threading.Thread(target=_reader, name="nf-monitor",
+                                                daemon=True)
+        self._monitor_thread.start()
 
-        while self.running:
+    def _on_network_change(self, detail: str) -> None:
+        with self._rebaseline_lock:
+            now = time.time()
+            if now - self._last_rebaseline < 5:
+                return  # rate-limit re-baseline storms
+            self._last_rebaseline = now
+
+        old = self.nm.snapshot()
+        self.nm.refresh()
+        new = self.nm.snapshot()
+
+        identity_changed = (
+            old["interface"] != new["interface"]
+            or old["my_ip"] != new["my_ip"]
+            or old["gateway_ip"] != new["gateway_ip"])
+
+        if identity_changed:
+            self.events.emit_simple(
+                "network.change", "notice", "confirmed",
+                f"Network identity changed: iface {old['interface']}->{new['interface']}, "
+                f"ip {old['my_ip']}->{new['my_ip']}, gw {old['gateway_ip']}->{new['gateway_ip']}",
+                source="engine", old=old, new=new, detail=detail)
+            # remove stale static pin before re-pinning
+            if old["gateway_ip"] and old["gateway_ip"] != new["gateway_ip"]:
+                if capabilities.have("root") and not cfg("general", "dry_run"):
+                    self.nm.remove_static_neighbor(old["gateway_ip"])
+            self._apply_protections()
+            self.arp_guard.rebaseline()
+            if not new["gateway_mac"]:
+                self.nm.resolve_mac_background()
+        # Silent refresh when only neighbor entries changed (no identity delta)
+
+    # ------------------------------------------------------------------ stop
+    def stop(self) -> None:
+        if not self.running:
+            return
+        log_info("Stopping defense engine (clean rollback of engine-owned state)")
+        self.running = False
+        self._stop.set()
+
+        # Stop guards (each cleans up its own resources)
+        for guard in (self.arp_guard, self.dhcp_guard, self.dns_guard,
+                      self.wifi, self.metrics):
             try:
-                with self._active_threat_lock:
-                    level = self._active_threat_level
-                profile = COUNTERMEASURE_PROFILE.get(level, COUNTERMEASURE_PROFILE[THREAT_MONITOR])
-
-                # Send corrective packets to gateway to keep our connection open
-                sendp(pkt_to_gw, count=profile["blast_count"],
-                      inter=profile["blast_interval"], verbose=False)
-                
-                # Active Wi-Fi access management: Disconnect unauthorized devices
-                self._mitigate_unauthorized_devices()
-                
-                time.sleep(profile["loop_sleep"])
+                guard.stop()
             except Exception as e:
-                log_err(f"Mitigation loop error: {e}")
-                time.sleep(1)
+                log_warn(f"Guard stop error ({type(guard).__name__}): {e}")
+        self.nm.stop()
 
-    def _mitigate_unauthorized_devices(self):
-        """
-        Actively disconnects unauthorized devices from accessing the network.
-        It target-blasts them with ARP spoofing redirects (mapping gateway IP to a dead MAC)
-        and sends gateway redirects mapping their IP to a dead MAC, effectively isolating them.
-        """
-        registered = self.registry.get_devices()
-        unauthorized_macs = [mac for mac, info in registered.items() if not info.get("is_authorized", False)]
-        
-        dead_mac = "00:00:00:00:00:00"
-        
-        for u_mac in unauthorized_macs:
-            info = registered[u_mac]
-            target_ip = info.get("last_ip")
-            if not target_ip:
-                continue
-            
-            # Send spoofed ARP reply to the target telling them the Gateway's MAC is a dead MAC
-            # This cuts off their outbound network path.
-            poison_target = (Ether(dst=u_mac, src=self.my_mac) /
-                             ARP(op=2, psrc=self.gw_ip, hwsrc=dead_mac, pdst=target_ip, hwdst=u_mac))
-            
-            # Send spoofed ARP reply to the gateway telling them the target's MAC is dead
-            # This cuts off their inbound path.
-            poison_gateway = (Ether(dst=self.gw_mac, src=self.my_mac) /
-                              ARP(op=2, psrc=target_ip, hwsrc=dead_mac, pdst=self.gw_ip, hwdst=self.gw_mac))
-            
+        if self._monitor_proc:
             try:
-                sendp(poison_target, count=2, verbose=False)
-                sendp(poison_gateway, count=2, verbose=False)
+                self._monitor_proc.terminate()
+            except OSError:
+                pass
+        if self._monitor_thread:
+            self._monitor_thread.join(timeout=2)
+
+        # Remove kernel state we own (never foreign rules — ADR-003)
+        if not cfg("general", "dry_run"):
+            self.firewall.remove()
+            snap = self.nm.snapshot()
+            if snap["gateway_ip"]:
+                self.nm.remove_static_neighbor(snap["gateway_ip"])
+
+        if self.dashboard is not None:
+            try:
+                self.dashboard.stop()
             except Exception:
                 pass
 
-    def _periodic_discovery_loop(self):
-        """Discovers new/active local IP/MAC devices to update registry and flag unauthorized ones."""
-        while self.running:
-            try:
-                hosts = self.nm.scan_local_network()
-                for ip, mac in hosts:
-                    if mac == self.my_mac or mac == self.gw_mac:
-                        continue
-                    # Check if registered. If not, log it.
-                    is_registered = mac in self.registry.devices
-                    # Register (by default first seen is not authorized)
-                    self.registry.register_device(mac=mac, ip=ip, hostname="Discovered Host")
-                    if not is_registered:
-                        log_warn(f"Discovered new unregistered Wi-Fi client device: {mac} at {ip}")
-            except Exception as e:
-                log_err(f"Discovery thread error: {e}")
-            
-            # Scan every 30 seconds
-            for _ in range(30):
-                if not self.running:
-                    break
-                time.sleep(1)
+        self.intel.stop()
+        self.events.emit_simple(
+            "engine.stop", "info", "confirmed",
+            "Defense engine stopped; engine-owned kernel state removed",
+            source="engine")
+        self.events.close()
+        log_success("Defense engine stopped cleanly")
 
-    def _sniff_callback(self, packet):
-        if not packet.haslayer(ARP):
-            return
-
-        arp = packet[ARP]
-
-        # Register/update the sender device in the registry to track who is currently active
-        sender_mac = arp.hwsrc.lower()
-        sender_ip = arp.psrc
-        if sender_mac != "00:00:00:00:00:00" and sender_mac != "ff:ff:ff:ff:ff:ff":
-            self.registry.register_device(mac=sender_mac, ip=sender_ip)
-
-        # ── Threat Checking: Check if device is spoofing or trying to impersonate ──
-        # CASE 1: Device pretending to be the Gateway
-        if arp.psrc == self.gw_ip and arp.hwsrc.lower() != self.gw_mac.lower():
-            attacker_mac = arp.hwsrc
-            profile = self.intel.record_attack(attacker_mac, "gateway_spoof", spoofed_ip=self.gw_ip)
-            log_warn(f"[ATTACK DETECTED] Host {attacker_mac} is spoofing the gateway IP {self.gw_ip}! Level: {profile.threat_level}")
-            self._update_active_threat(profile.threat_level)
-
-        # CASE 2: Device spoofing OUR IP Address
-        elif arp.psrc == self.my_ip and arp.hwsrc.lower() != self.my_mac.lower():
-            attacker_mac = arp.hwsrc
-            profile = self.intel.record_attack(attacker_mac, "identity_spoof", spoofed_ip=self.my_ip)
-            log_warn(f"[ATTACK DETECTED] Host {attacker_mac} is spoofing OUR local IP {self.my_ip}! Level: {profile.threat_level}")
-            self._update_active_threat(profile.threat_level)
-
-        # CASE 3: Floods / anomaly checks
-        elif arp.op == 2 and arp.pdst == arp.psrc:
-            # Gratuitous ARP from arbitrary MACs
-            if sender_mac not in (self.my_mac.lower(), self.gw_mac.lower()):
-                if sender_mac in self.intel.profiles:
-                    profile = self.intel.record_attack(sender_mac, "gratuitous_flood", spoofed_ip=arp.psrc)
-                    self._update_active_threat(profile.threat_level)
-
-    def _status_reporter(self):
-        while self.running:
-            for _ in range(60):
-                if not self.running:
-                    break
-                time.sleep(1)
-            if not self.running:
-                break
-            
-            lines = self.intel.get_status_report()
-            if lines:
-                print(f"\n{'─' * 90}")
-                print(f"  DYNAMIC BLACKLIST STATUS ({time.strftime('%H:%M:%S')})")
-                print(f"{'─' * 90}")
-                for line in lines:
-                    print(line)
-                print(f"{'─' * 90}\n")
-
-    def start(self):
-        banner = f"""
-  Network Interface: {self.nm.interface}
-  Your IP Address:   {self.my_ip}
-  Your MAC Address:  {self.my_mac}
-  Gateway IP:        {self.gw_ip}
-  Gateway MAC:       {self.gw_mac}
-"""
-        log_info(banner)
-        self.running = True
-
-        # Harden OS ARP Tables
-        self.nm.lock_arp_entry(self.gw_ip, self.gw_mac)
-        self.nm.apply_arptables_rules(self.my_ip, self.my_mac, self.gw_ip, self.gw_mac)
-
-        # Start mitigation
-        self.mitigation_thread = threading.Thread(target=self._active_mitigation_loop, daemon=True)
-        self.mitigation_thread.start()
-
-        # Start device discovery scanner
-        self.discovery_thread = threading.Thread(target=self._periodic_discovery_loop, daemon=True)
-        self.discovery_thread.start()
-
-        # Start blacklist status reporter
-        self.status_thread = threading.Thread(target=self._status_reporter, daemon=True)
-        self.status_thread.start()
-
-        log_info("Real-time threat monitoring and device isolation system is active.")
-        log_info("Sniffing network traffic. Press Ctrl+C to terminate...")
-
+    # -------------------------------------------------------------- signals
+    def _install_signal_handlers(self) -> None:
+        def _handler(signum, frame):
+            log_info(f"Signal {signum} received — shutting down")
+            self.stop()
         try:
-            sniff(filter="arp", prn=self._sniff_callback, store=0, iface=self.nm.interface)
-        except Exception as e:
-            log_err(f"Sniffer execution error: {e}")
+            signal.signal(signal.SIGTERM, _handler)
+            signal.signal(signal.SIGINT, _handler)
+        except (ValueError, OSError):
+            pass  # not main thread (e.g. tests) — ignore
+
+    # ----------------------------------------------------------- run/forever
+    def run_forever(self) -> None:
+        """Block until stopped (used by the CLI entry point)."""
+        try:
+            while self.running:
+                self._stop.wait(1.0)
+                self._watchdog()
+        finally:
             self.stop()
 
-    def stop(self):
-        log_info("Stopping Active Defense system and restoring network routing...")
-        self.running = False
+    def _watchdog(self) -> None:
+        """sd_notify watchdog heartbeat when running under systemd."""
+        try:
+            from netfend.utils.sd_notify import notify
+            notify("WATCHDOG=1")
+        except Exception:
+            pass
 
-        if self.mitigation_thread:
-            self.mitigation_thread.join(timeout=2)
-        if self.discovery_thread:
-            self.discovery_thread.join(timeout=2)
-        if self.status_thread:
-            self.status_thread.join(timeout=2)
-
-        self.intel.save()
-        self.registry.save()
-
-        # Clear kernel filters
-        self.nm.clear_arptables_rules()
-        self.nm.send_arp_restoration_blasts(self.my_ip, self.my_mac, self.gw_ip, self.gw_mac)
-        self.nm.unlock_arp_entry(self.gw_ip)
-
-        log_success("System deactivated successfully.")
+    # ------------------------------------------------------------- reporting
+    def status(self) -> Dict[str, Any]:
+        return {
+            "running": self.running,
+            "started_at": self.started_at,
+            "uptime_s": round(time.time() - self.started_at, 1) if self.started_at else None,
+            "identity": self.nm.snapshot(),
+            "capabilities": capabilities.summary(),
+            "firewall": self.firewall.status(),
+            "arp": {"active": self.arp_guard.evaluator is not None,
+                    "available": self.arp_guard.available()},
+            "dhcp": self.dhcp_guard.status(),
+            "dns": self.dns_guard.status(),
+            "wifi": self.wifi.status(),
+            "threats": self.intel.summary(),
+            "devices": len(self.registry.get_devices()),
+            "dry_run": bool(cfg("general", "dry_run")),
+        }

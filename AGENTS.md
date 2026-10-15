@@ -109,6 +109,10 @@ The next agent must not have to rediscover the same problem.
 - `ip neigh replace ... nud permanent` requires the interface to exist and
   be up; on network change the old static entry is invalid and must be
   removed (the engine handles this on every network-change event).
+- `ip -j addr` JSON puts the interface address under the key `"local"`
+  (NOT `"addr"` — that key does not exist for `family: inet`). Verified
+  against iproute2 on 2026-10-15; the parser accepts both but always
+  read `local` first.
 - `ip route` default line parsing: `via` may be absent (point-to-point), and
   `dev` may be followed by a metric clause. Parse defensively.
 - Bouncing an interface (`ip link set X down/up`) to "fix" connectivity
