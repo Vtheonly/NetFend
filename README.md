@@ -20,15 +20,23 @@ to events.
 
 | Threat | Detection | Mitigation on this device |
 |---|---|---|
-| ARP poisoning / gateway impersonation (NetCut-class) | ARP sniffer + confirmation logic | Static kernel neighbor entry for the gateway; nftables drops ARP frames claiming the gateway IP from a foreign MAC |
-| Own-IP hijack (IP conflict attacks) | ARP sniffer | nftables drops foreign-MAC ARP claiming your IP (DAD-safe) |
+| ARP poisoning / gateway impersonation (NetCut-class) | ARP sniffer + confirmation logic | Static kernel neighbor entry for the gateway; nftables drops ARP frames claiming the gateway IP from a foreign MAC; **sustained corrective self-assertion under attack** (bounded, airtime-budgeted, incl. unicast re-assertion to the gateway — ADR-006/P-28) |
+| Own-IP hijack (IP conflict attacks) | ARP sniffer | nftables drops foreign-MAC ARP claiming your IP (DAD-safe); corrective self-assertion |
 | IP-to-MAC flapping (poison/anti-poison fights) | Multi-MAC-per-IP window analysis | Alerting + evidence; kernel pin keeps your path stable |
 | Gratuitous-ARP floods (cache poisoning) | Per-source rate analysis | Alerting; flooding sources visible in dashboard |
+| MAC-rotation attackers (bettercap/NetCut changing MACs) | Behavioral fingerprints + **fuzzy cadence/technique correlation** (P-29) | Alias-group threat-level inheritance; rotation surfaced as `intel.mac_rotation` |
 | Rogue DHCP servers | Passive DHCP OFFER/ACK observation with learning window | Alerting (a client cannot block another DHCP server) |
-| DHCP lease-option manipulation (router/DNS options) | Baseline comparison | Alerting |
-| DNS configuration manipulation | resolv.conf/resolvectl watcher + resolution probes | Alerting + health verdict |
+| DHCP lease-option manipulation (router option 3 / DNS option 6 steering — incl. a compromised router) | Baseline comparison **against the kernel-verified gateway** (P-33) | **Override REJECTED**: trusted baseline kept, critical event, threat intel fed, steering target **dropped at nftables line rate** |
+| DNS manipulation by the router (fabricated answers, NXDOMAIN hijacking, captive-portal steering) | **NXDOMAIN-hijack signature check**: random `.invalid` label via system resolver + direct public-resolver ground truth (P-34) | Critical event with DoH/DoT + direct public-resolver guidance; standing recommendations when the resolver chain is LAN-only |
+| IPv6 takeover (mitm6, rogue RAs / SLAAC) | RA source-conflict detection (P-32) | **Suppressed on v4-only networks**: `accept_ra=0` + nftables rogue-RA drop (ADR-008); monitored when IPv6 is genuinely in use |
+| ICMP redirects / source routing (gateway-grade route hijack) | sysctl + nft counters (ADR-007) | `accept_redirects=0` (v4+v6), `accept_source_route=0`, `rp_filter` strict, line-rate redirect drops |
 | SYN/UDP connection floods, scans, ICMP floods | nftables meters + counters | Kernel-level per-source rate limiting (drop) |
 | Repeated Wi-Fi disconnects (possible deauth attacks) | Disconnect-pattern correlation with ARP/DHCP events | Alerting with confidence level |
+
+All kernel changes are **engine-owned and restored on stop**: sysctl
+originals persist to `hardening_state.json` / `ipv6_state.json` before
+any write; nftables rules live in `netfend_*` tables; static neighbor
+entries are removed — clean Ctrl+C, no interface flapping (ADR-007/008).
 
 ### Out of scope (be skeptical of any tool that claims otherwise)
 

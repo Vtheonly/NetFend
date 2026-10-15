@@ -439,3 +439,21 @@ references the legacy engine. Why: spec section D — zero residual
 legacy files; "archived reference" code that violates the ADRs is a
 resurrection hazard. Evidence: TestLegacyDebtRemoved (3 tests); suite
 231 passing; git history retains archaeology access.
+
+2026-10-16 — **T-37** (final closure, high-threat modernization) —
+What: closed the high-threat engine modernization round. AGENTS.md §5
+gained 8 new traps (strict rp_filter vs asymmetric routing, accept_ra
+fails open on unknown state + single-owner sysctls, /proc/sys direct
+writes with path-refusal, cooldown seeds must be -inf not 0.0, DHCP
+baselines are trust anchors, .invalid random-label ground truth,
+_deep_merge deep-copy, plus the standing deauth rule). README
+threat-model table now documents every new defense with its detection
+and mitigation columns; architecture diagram/invariants extended
+(KernelHardener, Ipv6Guard, ThreatIntelligence, ActiveDefense, override
+drops, airtime budget). Unknowns U-9..U-12 record on-target
+verification steps and the remaining future work (DHCPv6 content
+inspection, rp_filter/VPN note, v6-vs-v4 LAN decision). Verification:
+231/231 tests, doctor 14 passed (degraded env), bash -n clean on all
+scripts, every module imports without scapy, old/ absent.
+Why: the round's changes must survive the next agent without being
+rediscovered. Evidence: this commit + the test suite output above.

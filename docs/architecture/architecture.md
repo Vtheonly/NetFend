@@ -14,12 +14,17 @@
    │  ArpGuard ──────┐   ┌──────────────┐          ┌──────────────────┐              │
    │  DhcpGuard ─────┤   │  EventStore  │◄─────────│ FirewallManager  │              │
    │  DnsGuard ──────┼──►│ (SecurityEve │  events  │ (nft netfend_*)  │              │
-   │  WifiDiagnostics┤   │  nts, JSONL) │          │ validate/rollback│              │
-   │  FloodMonitor ──┘   └──────┬───────┘          └──────────────────┘              │
-   │                             │                                                   │
-   │  MetricsCollector ──────────┤          NetworkManager (identity, neighbors,     │
-   │  (throughput/latency/health)│           routes, passive discovery)              │
-   └─────────────────────────────┘                                                   │
+   │  Ipv6Guard ─────┤   │  nts, JSONL) │          │ validate/rollback│              │
+   │  WifiDiagnostics┤   └──────┬───────┘          │ + override drops │              │
+   │  FloodMonitor ──┘          │                  └──────────────────┘              │
+   │                             │          ┌──────────────────┐                    │
+   │  MetricsCollector ──────────┤          │ KernelHardener   │                    │
+   │  (throughput/latency/health)│          │ (sysctl, ADR-007)│                    │
+   │  ThreatIntelligence ───────┤          │ + IPv6 accept_ra │                    │
+   │  (profiles, MAC-rotation)  │          │ (ADR-008)        │                    │
+   │  ActiveDefense ────────────┘          └──────────────────┘                    │
+   │  (bounded corrective, ADR-006)             NetworkManager (identity,           │
+   └─────────────────────────────────           neighbors, routes, discovery)     │
                                     ┌────────────────────────────────────┐          │
                                     │ DashboardServer (127.0.0.1)        │◄─────────┘
                                     │  static/ + /api/* + auth+CSRF      │   reads EventStore,
@@ -45,11 +50,21 @@
 ## 3. Key Invariants
 
 - Steady state sends **zero packets** (ADR-002); the only transmitted
-  frames are optional event-triggered corrective ARPs after a *confirmed*
-  poisoning of this host's own cache, bounded and rate-limited (default
-  `max 5 per incident`).
-- Engine-owned nftables tables only; uninstall/crash cleanup deletes only
-  those tables and engine-created static neighbor entries.
+  frames are event-triggered corrective ARPs after *confirmed* threats,
+  bounded per burst (hard ceiling 10), sustained-mode interval ≥ 5 s,
+  and capped by a sliding **30 packets/minute airtime budget** (ADR-006,
+  P-28). Every corrective burst asserts only OUR identity (ADR-001).
+- Engine-owned kernel state only, each module restoring exactly what it
+  changed on stop: nftables `netfend_*` tables (+ dynamic override drops),
+  static neighbor entries, sysctl hardening set (`hardening_state.json`,
+  ADR-007), and `accept_ra` (`ipv6_state.json`, ADR-008). Stale state
+  files from crashed runs are recovered on next apply.
+- DHCP lease options are cross-checked against the kernel-verified
+  gateway; steering overrides are rejected (baseline kept) and their
+  targets dropped at line rate (P-33).
+- DNS answers are verified against direct public-resolver ground truth
+  (random `.invalid` labels); fabricated answers raise critical
+  hijack events with encrypted-DNS guidance (P-34).
 - All subprocess calls: argument lists, validated inputs, timeouts.
 - Every guard degrades to a WARNING capability event when its tool/privilege
   is missing; the engine itself never exits due to a missing optional

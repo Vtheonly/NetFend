@@ -170,6 +170,38 @@ The next agent must not have to rediscover the same problem.
   client adapters cannot see management frames destined to other stations.
   Never claim detection capability the hardware cannot provide — report
   it as unavailable and recommend 802.11w/PMF on the AP instead.
+- `rp_filter = 1` (strict) breaks asymmetric routing — multi-homed hosts
+  and some VPN setups need `hardening.rp_filter = "loose"` (2) or
+  `"preserve"`. Never hardcode the value outside
+  `hardening.build_param_list()` (ADR-007).
+- `accept_ra = 0` kills SLAAC IPv6: only ever set it when no IPv6
+  default route exists (auto mode) or the user forced `ipv6.ra_guard =
+  "on"`. Unknown routing state (`ip -6 route` unreadable) must fail OPEN
+  for connectivity. The `accept_ra` sysctls are owned by the IPv6 guard,
+  NOT KernelHardener — each module restores exactly what it changed
+  (ADR-008).
+- Write sysctls directly to `/proc/sys/<path>` (stdlib), never via the
+  `sysctl` binary (an optional package) and never through a shell. The
+  restore path must refuse any state entry outside `net/` or containing
+  `..` — a state file must never become an arbitrary file writer.
+- Evaluator cooldowns must be seeded with `None`/`-inf`, never `0.0`:
+  with synthetic timestamps (tests, simulators) a `0.0` seed swallows
+  the first event of every window. Found live in the DHCP/DNS/RA
+  evaluators 2026-10-16; production masked it only because wall-clock
+  time dwarfs the windows.
+- DHCP option baselines are TRUST anchors: `_update_option_baseline`
+  may only run on observations that passed the verified-gateway check
+  (P-33). Unconditional learning turns an attacker's option push into
+  the new "normal" in one observation.
+- The DNS `.invalid` TLD is reserved non-existent (RFC 2606) — the
+  hijack check relies on that. Query it with a RANDOM label (defeats
+  caches) and compare against a DIRECT public-resolver query (stdlib
+  UDP, hand-built wire format) — never against the system resolver
+  only, which is the thing being tested (P-34).
+- `_deep_merge` must deep-copy nested dicts from DEFAULTS: a shallow
+  copy shares the nested dicts, so runtime `set_config()` mutates
+  DEFAULTS itself and overrides survive config reloads (P-31, found
+  live via test pollution).
 
 ## 6. Repository Conventions
 
