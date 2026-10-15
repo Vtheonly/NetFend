@@ -143,6 +143,67 @@ class TestDhcpP23:
         assert ev2.evaluate(self.obs(), 2000.0) == []
 
 
+class TestDnsStubAwareness:
+    """P-24: systemd-resolved stub (127.0.0.53) is benign system plumbing."""
+
+    def _guard(self, events):
+        from netfend.services.dns_guard import DnsGuard
+
+        class FakeNm:
+            def snapshot(self):
+                return {"interface": "wlan0"}
+
+        return DnsGuard(FakeNm(), events)
+
+    def test_stub_resolved_to_effective_upstreams(self, events):
+        g = self._guard(events)
+        g.evaluator.baseline_servers = ["192.168.100.1", "fe80::1"]
+        # resolv.conf switched to the stub; resolvectl reports the same
+        # upstream servers as the baseline
+        g._stub_cache = ["192.168.100.1", "fe80::1"]
+        g._stub_cache_at = __import__("time").monotonic()
+        raw = ["127.0.0.53"]
+        effective = g._effective_for_raw(raw)
+        assert effective == ["192.168.100.1", "fe80::1"]
+        # no resolver-change event: the effective servers did not change
+        out = g.evaluator.evaluate_servers(effective, 1000.0)
+        assert out == []
+
+    def test_stub_fallback_without_resolvectl(self, events, monkeypatch):
+        g = self._guard(events)
+        # resolvectl unavailable AND resolv.conf unreadable -> the stub
+        # itself is compared (still stable across flaps, no event storm)
+        monkeypatch.setattr(g, "_effective_servers", lambda: [])
+        effective = g._effective_for_raw(["127.0.0.53"])
+        assert effective == ["127.0.0.53"]
+        # second call hits the cache, not resolvectl
+        assert g._effective_for_raw(["127.0.0.53"]) == ["127.0.0.53"]
+
+    def test_real_resolver_change_still_reported(self, events):
+        g = self._guard(events)
+        g.evaluator.baseline_servers = ["192.168.100.1"]
+        out = g.evaluator.evaluate_servers(["10.0.0.53"], 1000.0)
+        assert any(e["kind"] == "dns.config_change" for e in out)
+
+    def test_on_resolv_change_emits_benign_stub_note(self, events, tmp_path,
+                                                     monkeypatch):
+        """The stub takeover itself gets one informational event with the
+        real upstream servers — not a 'manipulation' warning."""
+        import netfend.services.dns_guard as dnsmod
+        resolv = tmp_path / "resolv.conf"
+        monkeypatch.setattr(dnsmod, "RESOLV_CONF", str(resolv))
+        g = self._guard(events)
+        g.evaluator.baseline_servers = ["192.168.100.1", "fe80::1"]
+        # simulate the stub takeover with unchanged effective servers
+        resolv.write_text("nameserver 127.0.0.53\n")
+        g._stub_cache = ["192.168.100.1", "fe80::1"]
+        g._stub_cache_at = __import__("time").monotonic()
+        g._on_resolv_change()
+        kinds = [e["kind"] for e in events.query(limit=20)]
+        assert "dns.stub_transition" in kinds
+        assert "dns.config_change" not in kinds
+
+
 class TestDnsEvaluator:
     def test_parse_resolv_conf(self):
         content = ("# comment\n"

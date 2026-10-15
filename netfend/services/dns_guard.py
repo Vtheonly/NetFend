@@ -10,6 +10,14 @@ Detects:
 Pure evaluator + adapter. Uses only the SYSTEM resolver for probes
 (socket.getaddrinfo) — never queries a custom server, so the probe
 reflects exactly what user applications experience.
+
+Field-tested fix (live report 2026-10-15, problem P-24): the event
+'DNS resolver set changed [192.168.100.1, fe80::1] -> [127.0.0.53]
+(VPN/roaming or manipulation)' fired on every Wi-Fi reconnect.
+127.0.0.53 is the systemd-resolved STUB — a benign, system-managed
+layer. The watch loop now resolves the stub back to the effective
+upstream servers (resolvectl) and only reports real changes; stub
+layer transitions alone produce a single informational event.
 """
 import socket
 import threading
@@ -21,6 +29,8 @@ from netfend.utils.config import cfg
 from netfend.utils.logging import log_info, log_warn
 
 RESOLV_CONF = "/etc/resolv.conf"
+RESOLVED_STUB = "127.0.0.53"   # systemd-resolved stub (P-24)
+_STUB_CACHE_S = 30.0            # resolvectl query cache during flapping
 
 
 def parse_resolv_conf(content: str) -> List[str]:
@@ -103,6 +113,8 @@ class DnsGuard:
         self._probe_thread: Optional[threading.Thread] = None
         self._last_mtime: Optional[float] = None
         self._last_size: Optional[int] = None
+        self._stub_cache: Optional[List[str]] = None
+        self._stub_cache_at: float = 0.0
 
     def start(self) -> bool:
         if not cfg("dns", "enabled", True):
@@ -143,6 +155,22 @@ class DnsGuard:
         except OSError:
             return []
 
+    def _effective_for_raw(self, raw: List[str]) -> List[str]:
+        """P-24: when resolv.conf only points at the systemd-resolved stub,
+        resolve the EFFECTIVE upstream servers via resolvectl (cached) so
+        stub-layer transitions do not register as resolver changes."""
+        if not raw or not all(s == RESOLVED_STUB for s in raw):
+            return raw
+        now = time.monotonic()
+        if (self._stub_cache is not None
+                and now - self._stub_cache_at < _STUB_CACHE_S):
+            return self._stub_cache
+        effective = self._effective_servers()
+        # if resolvectl failed, keep the stub itself (still comparable)
+        self._stub_cache = effective or raw
+        self._stub_cache_at = now
+        return self._stub_cache
+
     def _watch_loop(self):
         interval = cfg("dns", "watch_interval_s", 5)
         while not self._stop.wait(interval):
@@ -150,14 +178,33 @@ class DnsGuard:
                 st = self._stat_resolv()
                 if st and (st["mtime"] != self._last_mtime or st["size"] != self._last_size):
                     self._last_mtime, self._last_size = st["mtime"], st["size"]
-                    with open(RESOLV_CONF) as f:
-                        servers = parse_resolv_conf(f.read())
-                    for ev in self.evaluator.evaluate_servers(servers, time.time()):
-                        self.events.emit_simple(
-                            ev["kind"], ev["severity"], ev["confidence"],
-                            ev["summary"], source="dns", **ev.get("evidence", {}))
+                    self._on_resolv_change()
             except OSError:
                 continue
+
+    def _on_resolv_change(self):
+        """Handle one resolv.conf change (P-24 stub-aware)."""
+        with open(RESOLV_CONF) as f:
+            raw = parse_resolv_conf(f.read())
+        effective = self._effective_for_raw(raw)
+        stub_layer_changed = (
+            RESOLVED_STUB in raw
+            and self.evaluator.baseline_servers
+            and self.evaluator.baseline_servers != raw)
+        for ev in self.evaluator.evaluate_servers(effective, time.time()):
+            self.events.emit_simple(
+                ev["kind"], ev["severity"], ev["confidence"],
+                ev["summary"], source="dns", **ev.get("evidence", {}))
+        # P-24: pure stub-layer transitions are benign and get a single
+        # informational note instead of a warning-flavored 'manipulation'
+        # phrasing
+        if stub_layer_changed and effective == self.evaluator.baseline_servers:
+            self.events.emit_simple(
+                "dns.stub_transition", "info", "confirmed",
+                "systemd-resolved stub now manages /etc/resolv.conf "
+                "(system-managed resolver layer — benign); effective "
+                f"upstream servers unchanged: {effective}",
+                source="dns", raw=raw, effective=effective)
 
     def _stat_resolv(self) -> Optional[Dict[str, Any]]:
         try:
