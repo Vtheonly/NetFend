@@ -360,6 +360,7 @@ class DashboardServer:
                 "arp_inspection": self.engine.arp_guard.available(),
                 "dhcp_inspection": self.engine.dhcp_guard.available(),
                 "dns_watch": self.engine.dns_guard.status()["watching"],
+                "corrective_defense": self.engine.active_defense.status(),
             },
             "unavailable_protections": self._unavailable_protections(),
         }

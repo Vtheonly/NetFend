@@ -17,6 +17,7 @@ import time
 from typing import Any, Dict, Optional
 
 from netfend.models.events import EventStore
+from netfend.services.active_defense import ActiveDefense
 from netfend.services.arp_guard import ArpGuard
 from netfend.services.device_registry import DeviceRegistry
 from netfend.services.dhcp_guard import DhcpGuard
@@ -41,8 +42,10 @@ class DefenseEngine:
         self.intel = ThreatIntelligence()
         self.registry = DeviceRegistry()
         self.firewall = FirewallManager(self.nm, self.events)
+        self.active_defense = ActiveDefense(self.nm, self.events, self.intel)
         self.arp_guard = ArpGuard(self.nm, self.events, self.registry, self.intel,
-                                  on_gateway_rebaseline=self._on_gateway_rebaseline)
+                                  on_gateway_rebaseline=self._on_gateway_rebaseline,
+                                  on_threat=self.active_defense.handle_threat)
         self.dhcp_guard = DhcpGuard(self.nm, self.events)
         self.dns_guard = DnsGuard(self.nm, self.events)
         self.wifi = WifiDiagnostics(self.nm, self.events)
@@ -303,6 +306,7 @@ class DefenseEngine:
             "firewall": self.firewall.status(),
             "arp": {"active": self.arp_guard.evaluator is not None,
                     "available": self.arp_guard.available()},
+            "active_defense": self.active_defense.status(),
             "dhcp": self.dhcp_guard.status(),
             "dns": self.dns_guard.status(),
             "wifi": self.wifi.status(),

@@ -15,7 +15,14 @@
   },
   "arp": {
     "gateway_confirmations": 2,
-    "corrective_arp_enabled": true
+    "gateway_confirm_window_s": 60,
+    "old_gw_silence_s": 120,
+    "gateway_change_cooldown_s": 300,
+    "oscillation_window_s": 120,
+    "oscillation_min_transitions": 6,
+    "corrective_arp_enabled": true,
+    "corrective_arp_max": 5,
+    "corrective_arp_cooldown_s": 60
   },
   "dashboard": {
     "enabled": true,

@@ -48,6 +48,41 @@ class TestEngineSafetyInvariants:
         bad = self._scapy_send_calls(PKG / "services" / "dhcp_guard.py")
         assert bad == [], f"dhcp_guard.py must be passive: {bad}"
 
+    def test_active_defense_is_the_only_sender(self):
+        """ADR-006: only two modules may transmit at all —
+        - active_defense.py: bounded corrective self-assertion
+        - network_manager.py: one-shot srp for gateway MAC resolution and
+          the explicit on-demand scan (pre-existing, documented in ADR-005)
+        Any NEW sender must extend this allowlist consciously."""
+        allowed = {"active_defense.py", "network_manager.py"}
+        senders = set()
+        for f in (PKG / "services").glob("*.py"):
+            if self._scapy_send_calls(f):
+                senders.add(f.name)
+        assert senders <= allowed, \
+            f"unexpected packet senders: {sorted(senders - allowed)}"
+        assert "active_defense.py" in senders
+
+    def test_active_defense_sends_are_bounded_and_self_claiming(self):
+        """AST invariants: every sendp call carries count= (never an
+        unbounded blast), and the hard ceiling constant stays small."""
+        import ast
+        src = (PKG / "services" / "active_defense.py").read_text()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                fn = node.func
+                name = fn.id if isinstance(fn, ast.Name) else (
+                    fn.attr if isinstance(fn, ast.Attribute) else None)
+                if name == "sendp":
+                    kw = {k.arg for k in node.keywords}
+                    assert "count" in kw, "sendp without count= (unbounded)"
+        # identity safety: the only ARP construction claims our own address
+        # (psrc/hwsrc both bound to my_ip/my_mac — see ADR-001/006)
+        assert "psrc=my_ip, hwsrc=my_mac" in src
+        # the hard ceiling constant must exist and stay small
+        assert "_HARD_MAX_PACKETS = 10" in src
+
     def test_no_global_arptables_flush(self):
         """The legacy `arptables -F` / `nft flush ruleset` must not exist."""
         for f in PKG.rglob("*.py"):
