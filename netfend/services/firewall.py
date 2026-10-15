@@ -303,6 +303,8 @@ class FirewallManager:
         # which ruleset variant is active per table (P-18 observability)
         self.filter_variant: Optional[str] = None   # full|basic|minimal
         self.arp_variant: Optional[str] = None      # full|minimal
+        # IPs dropped as DHCP-override targets (P-33)
+        self.override_drops: List[str] = []
 
     # -- capability/status ---------------------------------------------------
     def available(self) -> bool:
@@ -570,7 +572,54 @@ class FirewallManager:
                 except (OSError, subprocess.SubprocessError):
                     pass
             self.applied = False
+            self.override_drops.clear()
             log_info("Firewall tables removed (clean shutdown)")
+
+    # -- dynamic override drops (P-33) ------------------------------------------
+    def add_override_drop(self, ip: str) -> bool:
+        """Drop all traffic to/from a DHCP-override target at line rate.
+
+        Called by the engine when a `dhcp.router_override` (critical,
+        confirmed) names a router option that is NOT the verified
+        gateway: the address is an attacker-controlled steering target,
+        and traffic must never flow through it. Rules live in our own
+        tables (ADR-003) and vanish with the table on engine stop.
+        Idempotent per IP.
+        """
+        if not valid_ipv4(ip):
+            log_warn(f"refusing override drop for invalid IP {ip!r}")
+            return False
+        if ip in self.override_drops:
+            return True
+        if not (self.applied and capabilities.have("nft")):
+            log_warn(f"cannot add override drop for {ip}: filter table not active")
+            return False
+        cmds = [
+            # ensure an output chain exists (input chain exists from apply)
+            ["nft", "add", "chain", "inet", FILTER_TABLE, "output",
+             "{ type filter hook output priority 0; policy accept; }"],
+            ["nft", "add", "rule", "inet", FILTER_TABLE, "input",
+             "ip", "saddr", ip, "counter", "drop",
+             "comment", "netfend: DHCP override source"],
+            ["nft", "add", "rule", "inet", FILTER_TABLE, "output",
+             "ip", "daddr", ip, "counter", "drop",
+             "comment", "netfend: DHCP override target"],
+        ]
+        for cmd in cmds:
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=_TIMEOUT)
+                # 'add chain' fails with EEXIST once the chain is there —
+                # that specific failure is expected and fine
+                if r.returncode != 0 and "File exists" not in (r.stderr or ""):
+                    log_err(f"override drop rejected: {_clip_err(r.stderr)}")
+                    return False
+            except (OSError, subprocess.SubprocessError) as e:
+                log_err(f"override drop error: {e}")
+                return False
+        self.override_drops.append(ip)
+        log_info(f"DHCP override target {ip} now dropped at line rate")
+        return True
 
     # -- observability ---------------------------------------------------------
     def read_counters(self) -> Dict[str, Dict[str, int]]:

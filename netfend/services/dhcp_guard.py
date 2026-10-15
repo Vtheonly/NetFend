@@ -16,7 +16,22 @@ Field-tested fixes (live report 2026-10-15, problem P-23):
     infrastructure (notice, not critical) — mesh node or router
   * baselines persist to DATA_DIR/dhcp_baseline.json so engine restarts
     stop re-learning (and re-flagging) the same known servers
+
+Zero-trust option-override rejection (P-33, threat model 2026-10-16):
+a rogue server OR a compromised router can push a router option (3) or
+DNS option (6) that steers traffic to an attacker proxy. The evaluator
+now REJECTS such pushes instead of learning them:
+- router option pointing anywhere other than the kernel-verified
+  default gateway => `dhcp.router_override` (critical, confirmed),
+  trusted baseline kept, threat intel fed, and (config
+  `dhcp.drop_override_targets`) the engine drops traffic to/from the
+  rogue router IP at nftables line rate
+- DNS option collapsing public resolvers to a single LAN address
+  => `dhcp.dns_override` (critical, suspected), baseline kept
+- changes consistent with the verified gateway (reconfigs, mesh)
+  keep the previous notice/warning behavior and ARE learned
 """
+import ipaddress
 import json
 import threading
 import time
@@ -32,6 +47,15 @@ DHCP_MESSAGE_TYPES = {1: "discover", 2: "offer", 3: "request",
                       4: "decline", 5: "ack", 6: "nak", 7: "release", 8: "inform"}
 
 _UNSET_IPS = ("", "0.0.0.0", None)
+
+
+def is_lan_ip(ip: Any) -> bool:
+    """True for RFC1918/link-local addresses (never loopback)."""
+    try:
+        addr = ipaddress.ip_address(str(ip))
+        return addr.is_private and not addr.is_loopback
+    except ValueError:
+        return False
 
 
 class DhcpEvaluator:
@@ -140,11 +164,39 @@ class DhcpEvaluator:
                     }})
             return events
 
-        # Known server: watch for option manipulation (router/DNS changes)
+        # Known server: watch for option manipulation (router/DNS changes).
+        # P-33: overrides that steer traffic away from the verified gateway
+        # or into a local DNS proxy are REJECTED (baseline kept); only
+        # gateway-consistent changes are learned.
         opts = obs.get("options") or {}
         router = opts.get("router")
         dns = opts.get("dns") or []
+        gw_ip = self.gateway.get("ip")
+
         if router and self.baseline_router and router != self.baseline_router:
+            if gw_ip and router != gw_ip:
+                # Option-3 override: the lease tries to move our default
+                # route to something that is NOT the kernel-verified
+                # gateway — rogue server or compromised router steering
+                # traffic to an attacker proxy. REJECT (no baseline learn).
+                if self._cooldown_ok(f"ovr-router:{router}", now, 300):
+                    events.append({
+                        "kind": "dhcp.router_override",
+                        "severity": "critical",
+                        "confidence": "confirmed",
+                        "summary": (f"DHCP lease from {self._display_ip(obs)} tries to "
+                                    f"set the default route to {router}, which is NOT "
+                                    f"the verified gateway {gw_ip} — rogue DHCP or "
+                                    f"compromised router steering traffic; override "
+                                    f"REJECTED (trusted baseline kept)"),
+                        "evidence": {
+                            "server_ip": self._display_ip(obs),
+                            "server_mac": obs.get("server_mac"),
+                            "baseline_router": self.baseline_router,
+                            "pushed_router": router,
+                            "verified_gateway": gw_ip,
+                        }})
+                return events
             if self._cooldown_ok(f"router:{router}", now, 300):
                 events.append({
                     "kind": "dhcp.router_option_change",
@@ -154,7 +206,28 @@ class DhcpEvaluator:
                                 f"{self.baseline_router} -> {router} "
                                 f"(lease renewal, VPN, or manipulation)"),
                     "evidence": {"old": self.baseline_router, "new": router}})
+
         if dns and self.baseline_dns and dns != self.baseline_dns:
+            if self._is_dns_override(dns):
+                # Option-6 override: public resolvers collapsed into a
+                # single LAN address — classic local-proxy steering.
+                if self._cooldown_ok(f"ovr-dns:{','.join(dns)}", now, 300):
+                    events.append({
+                        "kind": "dhcp.dns_override",
+                        "severity": "critical",
+                        "confidence": "suspected",
+                        "summary": (f"DHCP lease from {self._display_ip(obs)} replaces "
+                                    f"DNS servers {self.baseline_dns} with local-only "
+                                    f"{dns} — traffic steering to a local proxy; "
+                                    f"override REJECTED (trusted baseline kept; use "
+                                    f"encrypted DNS or public resolvers)"),
+                        "evidence": {
+                            "server_ip": self._display_ip(obs),
+                            "server_mac": obs.get("server_mac"),
+                            "baseline_dns": self.baseline_dns,
+                            "pushed_dns": dns,
+                        }})
+                return events
             if self._cooldown_ok(f"dns:{','.join(dns)}", now, 300):
                 events.append({
                     "kind": "dhcp.dns_option_change",
@@ -164,6 +237,16 @@ class DhcpEvaluator:
                     "evidence": {"old": self.baseline_dns, "new": dns}})
         self._update_option_baseline(obs)
         return events
+
+    def _is_dns_override(self, new_dns: List[str]) -> bool:
+        """True when public resolvers are being collapsed into local-only
+        addresses (the local-proxy steering signature). LAN-to-LAN and
+        public-to-public changes stay in the ambiguous/notice path."""
+        if not new_dns or not self.baseline_dns:
+            return False
+        new_all_lan = all(is_lan_ip(d) for d in new_dns)
+        baseline_had_public = any(not is_lan_ip(d) for d in self.baseline_dns)
+        return new_all_lan and baseline_had_public
 
     # -- persistence (P-23) ------------------------------------------------------
     @staticmethod
@@ -198,7 +281,7 @@ class DhcpEvaluator:
             self.baseline_dns = list(opts["dns"])
 
     def _cooldown_ok(self, key: str, now: float, cooldown: float) -> bool:
-        if now - self._last_rogue_emitted.get(key, 0.0) >= cooldown:
+        if now - self._last_rogue_emitted.get(key, float("-inf")) >= cooldown:
             self._last_rogue_emitted[key] = now
             return True
         return False
@@ -207,9 +290,12 @@ class DhcpEvaluator:
 class DhcpGuard:
     """Adapter: scapy sniffer with BPF `udp port 67` feeding the evaluator."""
 
-    def __init__(self, nm, events: EventStore):
+    def __init__(self, nm, events: EventStore, intel=None,
+                 on_override=None):
         self.nm = nm
         self.events = events
+        self.intel = intel                 # optional ThreatIntelligence (P-33)
+        self.on_override = on_override     # engine callback (drop rule, P-33)
         self.evaluator = DhcpEvaluator()
         self.evaluator.learn_observations = int(cfg("dhcp", "learn_observations", 2))
         self._sniffer = None
@@ -313,6 +399,20 @@ class DhcpGuard:
             self.events.emit_simple(
                 ev["kind"], ev["severity"], ev["confidence"], ev["summary"],
                 source="dhcp", **ev.get("evidence", {}))
+            # P-33: overrides and rogues feed the threat intelligence
+            if ev["kind"] in ("dhcp.router_override", "dhcp.dns_override",
+                              "dhcp.rogue_server") and self.intel:
+                mac = (ev.get("evidence", {}).get("server_mac") or "").lower()
+                if mac:
+                    target = (ev.get("evidence", {}).get("pushed_router")
+                              or ev.get("evidence", {}).get("pushed_dns"))
+                    self.intel.record_attack(mac, ev["kind"], target)
+            # P-33: engine may drop the override target at line rate
+            if ev["kind"] == "dhcp.router_override" and self.on_override:
+                try:
+                    self.on_override(ev)
+                except Exception:
+                    pass
         if set(self.evaluator.baseline_servers) != before:
             self._dirty = True
             self._save_baseline()  # debounced enough: only on new servers

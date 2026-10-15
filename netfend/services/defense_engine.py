@@ -50,7 +50,8 @@ class DefenseEngine:
         self.arp_guard = ArpGuard(self.nm, self.events, self.registry, self.intel,
                                   on_gateway_rebaseline=self._on_gateway_rebaseline,
                                   on_threat=self.active_defense.handle_threat)
-        self.dhcp_guard = DhcpGuard(self.nm, self.events)
+        self.dhcp_guard = DhcpGuard(self.nm, self.events, self.intel,
+                                    on_override=self._on_dhcp_override)
         self.dns_guard = DnsGuard(self.nm, self.events)
         self.wifi = WifiDiagnostics(self.nm, self.events)
         self.metrics = MetricsCollector(self.nm, self.events)
@@ -140,6 +141,36 @@ class DefenseEngine:
 
         # 4) nftables enforcement (validates + self-checks + rolls back)
         self.firewall.apply(ra_guard=ra_guard)
+
+    # -------------------------------------------------- dhcp override response
+    def _on_dhcp_override(self, ev: Dict[str, Any]) -> None:
+        """P-33: a confirmed DHCP router-override names a steering target.
+        Drop it at line rate (config-gated) so traffic can never flow
+        through the attacker's proxy; the kernel default route stays on
+        the verified gateway. Runs in a daemon thread (called from the
+        DHCP sniffer callback)."""
+        def _worker():
+            try:
+                target = ev.get("evidence", {}).get("pushed_router")
+                if not target:
+                    return
+                if not cfg("dhcp", "drop_override_targets", True):
+                    return
+                ok = self.firewall.add_override_drop(target)
+                self.events.emit_simple(
+                    "dhcp.override_dropped", "critical", "confirmed",
+                    f"DHCP override target {target} "
+                    + ("is now DROPPED at nftables line rate (traffic cannot "
+                       "flow through the steering proxy; revert by removing "
+                       "the engine tables or setting dhcp.drop_override_targets=false)"
+                       if ok else
+                       "could not be dropped (firewall table inactive) — "
+                       "verify the default route stays on the real gateway"),
+                    source="engine", target=target, dropped=ok)
+            except Exception as e:
+                log_warn(f"DHCP override response failed: {e}")
+        threading.Thread(target=_worker, name="nf-dhcp-override",
+                         daemon=True).start()
 
     def _on_gateway_rebaseline(self, gw_ip: str, new_mac: str) -> None:
         """P-19 feedback loop: the ARP guard accepted a legitimate gateway

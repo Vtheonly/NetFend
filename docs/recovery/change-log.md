@@ -360,3 +360,23 @@ guard decision before building the firewall ruleset and starts the RA
 sniffer with the other guards. Why: attackers pivot to IPv6 when IPv4
 is defended (mitm6); the previous engine had zero IPv6 coverage.
 Evidence: tests/test_ipv6_guard.py (18 tests); suite 200 passing.
+
+2026-10-16 — **T-33** (DHCP option-override rejection, P-33) —
+What: DhcpEvaluator now cross-checks lease options against the
+kernel-verified default gateway. Router option (3) pointing anywhere
+other than the verified gateway => dhcp.router_override (critical,
+confirmed): the trusted baseline is KEPT (the previous code learned
+the attacker's value in one observation — the core bug), threat
+intel records the server MAC, and the engine (config
+dhcp.drop_override_targets, default true) drops the steering target
+at nftables line rate (input saddr + output daddr in netfend_filter,
+vanishing with the table on stop). DNS option (6) collapsing public
+resolvers to LAN-only addresses => dhcp.dns_override (critical,
+suspected), baseline kept. Gateway-consistent changes (legit
+reconfig/mesh) keep the warning/notice path and ARE learned.
+Bug also fixed: evaluator cooldowns seeded with 0.0 meant synthetic
+first events inside a 300 s window could never emit (DHCP + DNS
+evaluators; production used wall-clock so it was latent) — seeded
+with -inf now. Why: zero-trust threat model — the router itself may
+be compromised; option pushes are its steering primitive.
+Evidence: tests/test_dhcp_override.py (13 tests); suite 213 passing.

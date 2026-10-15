@@ -138,6 +138,7 @@ DEFAULTS: Dict[str, Any] = {
         "enabled": True,
         "learn_observations": 2,        # learning window before rogue flagging
         "lease_watch": True,
+        "drop_override_targets": True,  # P-33: line-rate drop of confirmed router-override targets
     },
     "dns": {
         "enabled": True,

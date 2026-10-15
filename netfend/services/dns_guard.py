@@ -59,7 +59,7 @@ class DnsEvaluator:
             return events
         if self.baseline_servers and servers != self.baseline_servers:
             key = ",".join(servers)
-            if now - self._last_change_emitted.get(key, 0.0) >= 300:
+            if now - self._last_change_emitted.get(key, float("-inf")) >= 300:
                 self._last_change_emitted[key] = now
                 events.append({
                     "kind": "dns.config_change",
@@ -77,7 +77,7 @@ class DnsEvaluator:
         events: List[Dict[str, Any]] = []
         if not probe.get("ok"):
             key = "probe_fail"
-            if now - self._last_change_emitted.get(key, 0.0) >= 120:
+            if now - self._last_change_emitted.get(key, float("-inf")) >= 120:
                 self._last_change_emitted[key] = now
                 events.append({
                     "kind": "dns.resolution_failure",
@@ -88,7 +88,7 @@ class DnsEvaluator:
                     "evidence": probe})
         elif probe.get("elapsed_s", 0) > self.probe_slow_s:
             key = "probe_slow"
-            if now - self._last_change_emitted.get(key, 0.0) >= 300:
+            if now - self._last_change_emitted.get(key, float("-inf")) >= 300:
                 self._last_change_emitted[key] = now
                 events.append({
                     "kind": "dns.slow_resolution",
