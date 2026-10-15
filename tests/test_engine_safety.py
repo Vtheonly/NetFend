@@ -304,3 +304,28 @@ class TestStaticAssets:
         for ep in ("overview", "security", "events", "topology",
                    "performance", "attack_protection"):
             assert ep in called, f"app.js never fetches {ep} (found: {sorted(called)})"
+
+
+class TestLegacyDebtRemoved:
+    """T-36 / spec 'Complete Removal of Legacy Debt': old/ must stay
+    deleted and nothing may resurrect the legacy patterns."""
+
+    def test_old_directory_absent(self):
+        assert not (ROOT / "old").exists(), \
+            "old/ must not exist — its concepts are absorbed " \
+            "(docs/architecture/legacy-absorption-map.md)"
+
+    def test_absorption_map_documents_every_legacy_concept(self):
+        m = (ROOT / "docs" / "architecture" / "legacy-absorption-map.md").read_text()
+        for concept in ("threat ladder", "fingerprint", "alias",
+                        "blacklist", "self-assertion", "static pin",
+                        "arptables", "gateway spoof", "net_reset"):
+            assert concept.lower() in m.lower(), \
+                f"absorption map missing concept: {concept}"
+
+    def test_no_legacy_engine_entrypoint_anywhere(self):
+        """No script may execute the legacy NetFend Pro engine."""
+        for sh in (ROOT / "scripts").glob("*.sh"):
+            src = sh.read_text()
+            assert "NetFend Pro" not in src, f"{sh} references legacy engine"
+        assert not (ROOT / "old").exists()

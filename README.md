@@ -118,8 +118,10 @@ The old muscle-memory names keep working and map to the same engine:
 | `net_watch` | status snapshot + dashboard URL |
 | `net_blacklist` | threat profiles (with age decay markers) |
 
-The legacy engine under `old/` is archived reference only — see
-`old/README.md` for why it must never be executed.
+The legacy engine that once lived under `old/` is completely removed;
+`docs/architecture/legacy-absorption-map.md` is the permanent record of
+where every one of its useful concepts now lives and which flaws were
+eliminated instead of ported.
 
 ### Manual run (no systemd)
 

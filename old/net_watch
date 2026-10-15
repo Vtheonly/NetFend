@@ -1,3 +1,0 @@
-#!/bin/bash
-echo "[NetFend Pro] ARP Monitor (live)"
-watch -n 1 "arp -an"

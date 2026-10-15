@@ -4,9 +4,10 @@
 #
 # The owner's muscle memory is `net_protect` — one command, sudo,
 # engine in the foreground. These shims keep that workflow but point
-# at the MODERN engine (the legacy engine is archived under old/ and
-# must never be executed: it violates ADR-001/002 and crashes on
-# stop — see docs/audit.md and report.md).
+# at the MODERN engine (the legacy engine has been completely removed;
+# docs/architecture/legacy-absorption-map.md records where its useful
+# concepts now live. It must never be executed: it violated
+# ADR-001/002 and crashed on stop — see docs/audit.md and report.md).
 # ============================================================
 set -euo pipefail
 

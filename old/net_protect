@@ -1,3 +1,0 @@
-#!/bin/bash
-echo "[NetFend Pro] Launching Advanced Defense Engine..."
-sudo python3 /usr/local/bin/net_defender.py "$@"

@@ -419,3 +419,23 @@ profile switch cannot silently drop the RA rule. Why: capabilities
 that the operator cannot see or configure are capabilities they
 cannot trust. Evidence: live doctor run in sandbox (output in commit
 message), extended static-asset test, suite 228 passing.
+
+2026-10-16 — **T-36** (legacy debt removal, P-36) —
+What: `old/` deleted entirely (engine + 5 launchers + symlink, 762
+lines). Before deletion every useful defensive concept, threshold
+rule, and mitigation strategy was audited against the modern package
+and documented in `docs/architecture/legacy-absorption-map.md`:
+14 concepts absorbed with concrete improvements (threat ladder +aging,
+fingerprints +fuzzy MAC-rotation, alias inheritance +bidirectional
+persistence, self-assertion +sustained mode/airtime budget/unicast,
+static pin +re-baselining, ARP filtering on nftables, detection cases
++oscillation/flapping, CLI/launcher compat), 8 legacy flaws eliminated
+instead of ported (timed blasts, gateway-identity claims, arptables -F,
+L3 crash class, per-packet disk writes, static trust, shell=True,
+interface bouncing), plus the capabilities the legacy engine never had
+(sysctl hardening, IPv6 RA guard, DHCP override rejection, DNS hijack
+checks). Hygiene tests now assert old/ stays deleted and no script
+references the legacy engine. Why: spec section D — zero residual
+legacy files; "archived reference" code that violates the ADRs is a
+resurrection hazard. Evidence: TestLegacyDebtRemoved (3 tests); suite
+231 passing; git history retains archaeology access.
