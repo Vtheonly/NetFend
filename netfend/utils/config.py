@@ -108,8 +108,14 @@ DEFAULTS: Dict[str, Any] = {
         "gratuitous_rate_per_s": 10,    # gARP flood threshold per source MAC
         "gratuitous_burst": 25,
         "gateway_confirmations": 2,     # observations before treating gw MAC change as real
-        "corrective_arp_max": 5,        # bounded, event-triggered only (ADR-002)
+        "gateway_confirm_window_s": 60, # ... within this window
+        "old_gw_silence_s": 120,        # pinned gw MAC silent this long => replacement candidate
+        "gateway_change_cooldown_s": 300,  # per-MAC cooldown for gateway_change events
+        "oscillation_window_s": 120,    # gateway MAC alternation window (P-19)
+        "oscillation_min_transitions": 6,  # switches in window => oscillation, not change
+        "corrective_arp_max": 5,        # bounded, event-triggered only (ADR-002/006)
         "corrective_arp_enabled": True,
+        "corrective_arp_cooldown_s": 60,
     },
     "dhcp": {
         "enabled": True,

@@ -133,5 +133,97 @@ class TestMisc:
         ev.evaluate(pkt(psrc=GW["ip"], hwsrc=ATTACKER), 1000.0)
         ev.rebaseline("10.0.0.1", "33:33:33:33:33:33")
         assert ev.gw_ip == "10.0.0.1"
-        assert ev.pending_gw_change is None
+        assert len(ev.gw_claims) == 0
         assert len(ev.ip_mac_history) == 0
+
+
+class TestGatewayRebaseline:
+    """P-19 live-fire regression: gateway_change spam + missing feedback."""
+
+    def test_change_event_carries_rebaseline_and_updates_trust(self):
+        ev = make_evaluator()
+        now = 1000.0
+        new_router = "22:22:22:22:22:22"
+        ev.evaluate(pkt(psrc=GW["ip"], hwsrc=GW["mac"]), now)
+        later = now + 600
+        ev.evaluate(pkt(psrc=GW["ip"], hwsrc=new_router), later)
+        out = ev.evaluate(pkt(psrc=GW["ip"], hwsrc=new_router), later + 1)
+        change = next(e for e in out if e["kind"] == "arp.gateway_change")
+        assert change["rebaseline"]["new_mac"] == new_router
+        assert change["evidence"]["rebaselined"] is True
+        # trust moved: subsequent frames from the new router are NOT foreign
+        assert ev.gw_mac == new_router
+        out2 = ev.evaluate(pkt(psrc=GW["ip"], hwsrc=new_router), later + 5)
+        assert not any(e["kind"] == "arp.gateway_change" for e in out2)
+
+    def test_no_spam_after_accepted_change(self):
+        """The live bug: 106 identical gateway_change events in ~3 min.
+        After re-baselining, the same MAC must never re-trigger."""
+        ev = make_evaluator()
+        now = 1000.0
+        new_router = "22:22:22:22:22:22"
+        ev.evaluate(pkt(psrc=GW["ip"], hwsrc=GW["mac"]), now)
+        later = now + 600
+        changes = 0
+        for i in range(120):  # 2 frames/second for a minute
+            out = ev.evaluate(pkt(psrc=GW["ip"], hwsrc=new_router), later + i * 0.5)
+            changes += sum(1 for e in out if e["kind"] == "arp.gateway_change")
+        assert changes == 1
+
+    def test_oscillation_not_rebaselined(self):
+        """Mesh ping-pong: a FORMER trusted MAC returning after silence is
+        oscillation, not another router change: trust stays put and ONE
+        aggregated event fires instead of a change-flood."""
+        ev = make_evaluator()
+        now = 1000.0
+        other = "22:22:22:22:22:22"
+        # seed: trusted gateway seen once
+        ev.evaluate(pkt(psrc=GW["ip"], hwsrc=GW["mac"]), now)
+        # old gw goes silent; other MAC claims gateway (accepted as change)
+        ev.evaluate(pkt(psrc=GW["ip"], hwsrc=other), now + 200)
+        ev.evaluate(pkt(psrc=GW["ip"], hwsrc=other), now + 201)
+        assert ev.gw_mac == other  # re-baselined to the new MAC
+        # ... later the ORIGINAL gateway returns (other silent > 120 s)
+        all_events = []
+        for i in range(6):
+            all_events += ev.evaluate(pkt(psrc=GW["ip"], hwsrc=GW["mac"]),
+                                      now + 400 + i)
+        osc = [e for e in all_events if e["kind"] == "arp.gateway_oscillation"]
+        assert osc, "return of a former gateway MAC must be oscillation"
+        assert ev.gw_mac == other          # trust did NOT flip back
+        assert len(osc) == 1               # aggregated, not per-packet
+
+    def test_oscillation_event_content(self):
+        ev = make_evaluator()
+        now = 1000.0
+        other = "22:22:22:22:22:22"
+        ev.evaluate(pkt(psrc=GW["ip"], hwsrc=GW["mac"]), now)
+        ev.evaluate(pkt(psrc=GW["ip"], hwsrc=other), now + 200)
+        ev.evaluate(pkt(psrc=GW["ip"], hwsrc=other), now + 201)
+        all_events = []
+        for i in range(6):
+            all_events += ev.evaluate(pkt(psrc=GW["ip"], hwsrc=GW["mac"]),
+                                      now + 400 + i)
+        osc = [e for e in all_events if e["kind"] == "arp.gateway_oscillation"]
+        e = osc[0]
+        assert e["severity"] == "warning"
+        assert e["confidence"] == "suspected"
+        assert other in e["evidence"]["oscillating_macs"]
+        assert GW["mac"] in e["evidence"]["oscillating_macs"]
+        assert e["evidence"]["trusted_mac"] == other
+
+    def test_overlapping_claims_stay_conflicts(self):
+        """Both MACs actively claiming at the same time is the classic
+        poison signature: gateway_spoof (critical/confirmed), NOT a
+        legitimate change or oscillation."""
+        ev = make_evaluator()
+        now = 1000.0
+        attacker = "de:ad:be:ef:00:01"
+        kinds = []
+        for i in range(20):
+            mac = GW["mac"] if i % 2 == 0 else attacker
+            out = ev.evaluate(pkt(psrc=GW["ip"], hwsrc=mac), now + i)
+            kinds += [e["kind"] for e in out]
+        assert "arp.gateway_spoof" in kinds
+        assert "arp.gateway_change" not in kinds
+        assert ev.gw_mac == GW["mac"]   # trust never moved

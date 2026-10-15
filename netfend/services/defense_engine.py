@@ -41,7 +41,8 @@ class DefenseEngine:
         self.intel = ThreatIntelligence()
         self.registry = DeviceRegistry()
         self.firewall = FirewallManager(self.nm, self.events)
-        self.arp_guard = ArpGuard(self.nm, self.events, self.registry, self.intel)
+        self.arp_guard = ArpGuard(self.nm, self.events, self.registry, self.intel,
+                                  on_gateway_rebaseline=self._on_gateway_rebaseline)
         self.dhcp_guard = DhcpGuard(self.nm, self.events)
         self.dns_guard = DnsGuard(self.nm, self.events)
         self.wifi = WifiDiagnostics(self.nm, self.events)
@@ -123,6 +124,23 @@ class DefenseEngine:
 
         # 2) nftables enforcement (validates + self-checks + rolls back)
         self.firewall.apply()
+
+    def _on_gateway_rebaseline(self, gw_ip: str, new_mac: str) -> None:
+        """P-19 feedback loop: the ARP guard accepted a legitimate gateway
+        MAC change (persistent new MAC, old one silent, no oscillation).
+        Re-apply kernel protections with the new trust anchor so the
+        static pin and the arp firewall table stop defending a ghost."""
+        try:
+            log_info(f"Gateway re-baseline: {gw_ip} -> {new_mac}; "
+                     "re-applying protections")
+            self.events.emit_simple(
+                "arp.rebaseline", "notice", "confirmed",
+                f"Gateway trust re-baselined to {new_mac}; "
+                "static pin and firewall rules re-applied",
+                source="engine", gateway_ip=gw_ip, new_mac=new_mac)
+            self._apply_protections()
+        except Exception as e:
+            log_warn(f"Gateway re-baseline protection re-apply failed: {e}")
 
     # ------------------------------------------------------ network monitoring
     def _start_netlink_monitor(self):

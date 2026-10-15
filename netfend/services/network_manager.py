@@ -214,6 +214,16 @@ class NetworkManager:
                 "link_up": self.link_up,
             }
 
+    def set_gateway_mac(self, mac: str) -> None:
+        """Thread-safe gateway MAC update (P-19: ARP guard re-baseline
+        after a confirmed legitimate gateway change feeds back into the
+        shared identity, so re-pinning and firewall rebuilds use it)."""
+        if not (mac and valid_mac(mac)):
+            return
+        with self._identity_lock:
+            if self.gw_mac != mac.lower():
+                self.gw_mac = mac.lower()
+
     # -- neighbor table -----------------------------------------------------
     def get_neighbors(self) -> List[Dict[str, str]]:
         """Current kernel neighbor entries (passive discovery source)."""

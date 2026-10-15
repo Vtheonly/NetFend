@@ -11,6 +11,9 @@ Pure evaluation + optional scapy sniffer (ADR-005). Detections:
   the classic poison/anti-poison fight signature
 - gratuitous ARP floods: rate-based per source MAC (token window)
 - unsolicited ARP reply storms
+- gateway MAC oscillation: the gateway IP alternating between a small set
+  of MACs — mesh/roaming OR a poison fight; distinct from a one-time
+  router replacement (P-19)
 
 False-positive controls (AGENTS.md rule 7):
 - our own transmissions are ignored
@@ -18,11 +21,24 @@ False-positive controls (AGENTS.md rule 7):
   workflow requires `gateway_confirmations` consistent observations AND
   the old gateway being absent before re-baselining
 - flapping requires >= flap_mac_count distinct MACs within flap_window_s
+
+Field-tested fixes (live report 2026-10-15, problem P-19):
+The first deployment spammed `arp.gateway_change` every 1-2 s for minutes
+(106 identical events in the dashboard log). Root cause: after concluding
+"legitimate router change" the evaluator NEVER updated its baseline, so
+every subsequent ARP from the new gateway MAC re-triggered the whole
+workflow. Now:
+- a confirmed legitimate change RE-BASELINES the evaluator (the new MAC
+  becomes trusted) and notifies the engine (re-pin + firewall rebuild)
+  via the `rebaseline` key in the emitted event
+- gateway_change events carry a per-MAC cooldown
+- alternation between MACs is classified as oscillation (one aggregated
+  event, not a change-flood)
 """
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from netfend.models.events import EventStore
 from netfend.utils import capabilities
@@ -43,8 +59,10 @@ class ArpEvaluator:
         self.ip_mac_history: Dict[str, deque] = defaultdict(
             lambda: deque(maxlen=MAX_HISTORY_PER_IP))
         self.garp_timestamps: Dict[str, deque] = defaultdict(deque)
-        # gateway-change workflow state
-        self.pending_gw_change: Optional[Dict[str, Any]] = None
+        # per-source MAC claim timestamps for the gateway IP (P-19)
+        self.gw_claims: Dict[str, deque] = defaultdict(deque)
+        # MACs that previously held gateway trust (for oscillation context)
+        self.gw_former_macs: List[str] = []
         self.last_conflict_emitted: Dict[str, float] = {}
         self.emitted_flap: Dict[str, float] = {}
 
@@ -63,11 +81,57 @@ class ArpEvaluator:
             dq.popleft()
         return len(dq) <= max_count
 
+    def _cooldown_ok(self, key: str, now: float, cooldown: float) -> bool:
+        last = self.last_conflict_emitted.get(key, 0.0)
+        if now - last >= cooldown:
+            self.last_conflict_emitted[key] = now
+            return True
+        return False
+
+    # -- gateway trust (P-19) --------------------------------------------------
+    def _record_gw_claim(self, mac: str, now: float) -> int:
+        """Record a foreign claim on the gateway IP; returns the number of
+        claims from this MAC inside the confirmation window."""
+        window = cfg("arp", "gateway_confirm_window_s", 60)
+        dq = self.gw_claims[mac]
+        dq.append(now)
+        while dq and now - dq[0] > window:
+            dq.popleft()
+        return len(dq)
+
+    def _gateway_alternations(self, now: float) -> int:
+        """Count MAC switches in the gateway IP's observation history
+        within the oscillation window (consecutive duplicates are already
+        deduped by _observed, so every history entry IS a switch)."""
+        window = cfg("arp", "oscillation_window_s", 120)
+        hist = self.ip_mac_history.get(self.gw_ip or "", deque())
+        return sum(1 for (mac, ts) in hist if now - ts <= window) - 1 \
+            if hist else 0
+
+    def _old_gateway_alive(self, now: float) -> bool:
+        """Heuristic: did we observe the pinned gateway MAC recently?"""
+        silence = cfg("arp", "old_gw_silence_s", 120)
+        hist = self.ip_mac_history.get(self.gw_ip or "", deque())
+        for mac, ts in hist:
+            if mac == self.gw_mac and (now - ts) <= silence:
+                return True
+        return False
+
+    def _accept_new_gateway(self, hwsrc: str) -> None:
+        """Re-baseline: the new MAC becomes the trusted gateway (P-19)."""
+        if self.gw_mac and self.gw_mac != hwsrc:
+            self.gw_former_macs.append(self.gw_mac)
+            self.gw_former_macs = self.gw_former_macs[-4:]
+        self.gw_mac = hwsrc
+        self.gw_claims.clear()
+
     # -- main evaluation -------------------------------------------------------
     def evaluate(self, pkt: Dict[str, Any], now: float) -> List[Dict[str, Any]]:
         """pkt: {op:int(1=req,2=reply), psrc:str, hwsrc:str, pdst:str, hwdst:str}
         Returns a list of event dicts (kind, severity, confidence, summary,
-        evidence). Caller turns them into SecurityEvents."""
+        evidence). The gateway_change event additionally carries a
+        `rebaseline` key the adapter must act on (engine re-pin callback).
+        Caller turns them into SecurityEvents."""
         events: List[Dict[str, Any]] = []
         op = pkt.get("op")
         psrc = pkt.get("psrc", "")
@@ -82,14 +146,10 @@ class ArpEvaluator:
 
         # ---- CASE 1: someone claims the gateway IP --------------------------
         if self.gw_ip and psrc == self.gw_ip and self.gw_mac and hwsrc != self.gw_mac:
-            if self.pending_gw_change and self.pending_gw_change["mac"] == hwsrc:
-                self.pending_gw_change["count"] += 1
-                self.pending_gw_change["last_ts"] = now
-            else:
-                self.pending_gw_change = {
-                    "mac": hwsrc, "count": 1, "first_ts": now, "last_ts": now}
+            claims = self._record_gw_claim(hwsrc, now)
             confirmations = cfg("arp", "gateway_confirmations", 2)
-            if self.pending_gw_change["count"] >= confirmations:
+
+            if claims >= confirmations:
                 old_alive = self._old_gateway_alive(now)
                 if old_alive:
                     # Both MACs claim the gateway => classic MITM/poison
@@ -105,25 +165,66 @@ class ArpEvaluator:
                                 "gateway_ip": self.gw_ip,
                                 "pinned_gateway_mac": self.gw_mac,
                                 "conflicting_mac": hwsrc,
-                                "observations": self.pending_gw_change["count"],
+                                "observations": claims,
                                 "old_gateway_still_active": True,
                             }})
                 else:
-                    # Old gateway silent + new MAC persistent => router replaced
-                    events.append({
-                        "kind": "arp.gateway_change",
-                        "severity": "notice",
-                        "confidence": "unverified",
-                        "summary": (f"Gateway {self.gw_ip} now announces MAC {hwsrc} "
-                                    f"(previous {self.gw_mac} silent) — likely legitimate "
-                                    f"router change; re-baselining recommended"),
-                        "evidence": {
-                            "gateway_ip": self.gw_ip,
-                            "old_mac": self.gw_mac,
-                            "new_mac": hwsrc,
-                            "observations": self.pending_gw_change["count"],
-                        }})
-                self.pending_gw_change = None
+                    # Trusted gateway silent + this foreign MAC persistent.
+                    # Distinguish a one-time replacement from oscillation:
+                    alternations = self._gateway_alternations(now)
+                    min_alt = cfg("arp", "oscillation_min_transitions", 6)
+                    if alternations >= min_alt or hwsrc in self.gw_former_macs:
+                        # MACs keep trading the gateway role: mesh/roaming
+                        # or a poison fight — do NOT re-baseline, keep trust.
+                        key = "gwosc"
+                        if self._cooldown_ok(key, now, 120):
+                            osc_window = cfg("arp", "oscillation_window_s", 120)
+                            hist = self.ip_mac_history.get(self.gw_ip or "", deque())
+                            macs = {m for (m, t) in hist if now - t <= osc_window}
+                            macs.add(self.gw_mac)
+                            macs.add(hwsrc)
+                            events.append({
+                                "kind": "arp.gateway_oscillation",
+                                "severity": "warning",
+                                "confidence": "suspected",
+                                "summary": (f"Gateway {self.gw_ip} MAC oscillates between "
+                                            f"{len(macs)} addresses ({', '.join(sorted(macs))}); "
+                                            f"{alternations} switches recently — mesh/roaming "
+                                            f"node or poison/anti-poison fight; trust kept on "
+                                            f"{self.gw_mac}"),
+                                "evidence": {
+                                    "gateway_ip": self.gw_ip,
+                                    "trusted_mac": self.gw_mac,
+                                    "oscillating_macs": sorted(macs),
+                                    "alternations": alternations,
+                                    "window_s": osc_window,
+                                }})
+                    else:
+                        # Persistent new MAC, silent old one, no oscillation:
+                        # accept as a legitimate gateway change — ONCE — and
+                        # re-baseline so it is not re-flagged forever (P-19).
+                        key = f"gwchg:{hwsrc}"
+                        cooldown = cfg("arp", "gateway_change_cooldown_s", 300)
+                        if self._cooldown_ok(key, now, cooldown):
+                            old_mac = self.gw_mac
+                            events.append({
+                                "kind": "arp.gateway_change",
+                                "severity": "notice",
+                                "confidence": "unverified",
+                                "summary": (f"Gateway {self.gw_ip} now announces MAC {hwsrc} "
+                                            f"(previous {old_mac} silent) — treated as router "
+                                            f"replacement; baseline updated, rules re-applied"),
+                                "evidence": {
+                                    "gateway_ip": self.gw_ip,
+                                    "old_mac": old_mac,
+                                    "new_mac": hwsrc,
+                                    "observations": claims,
+                                    "rebaselined": True,
+                                },
+                                # adapter contract: engine must re-pin + rebuild
+                                "rebaseline": {"gateway_ip": self.gw_ip,
+                                               "new_mac": hwsrc}})
+                            self._accept_new_gateway(hwsrc)
 
         # ---- CASE 2: someone claims OUR IP -----------------------------------
         elif psrc == self.my_ip and hwsrc != self.my_mac:
@@ -176,37 +277,28 @@ class ArpEvaluator:
 
         return events
 
-    def _old_gateway_alive(self, now: float) -> bool:
-        """Heuristic: did we observe the pinned gateway MAC recently?"""
-        hist = self.ip_mac_history.get(self.gw_ip or "", deque())
-        for mac, ts in hist:
-            if mac == self.gw_mac and (now - ts) <= 120:
-                return True
-        return False
-
-    def _cooldown_ok(self, key: str, now: float, cooldown: float) -> bool:
-        last = self.last_conflict_emitted.get(key, 0.0)
-        if now - last >= cooldown:
-            self.last_conflict_emitted[key] = now
-            return True
-        return False
-
     def rebaseline(self, gw_ip: Optional[str], gw_mac: Optional[str]) -> None:
         """Called on network change / explicit re-baseline."""
         self.gw_ip, self.gw_mac = gw_ip, (gw_mac or "").lower()
-        self.pending_gw_change = None
         self.ip_mac_history.clear()
         self.garp_timestamps.clear()
+        self.gw_claims.clear()
+        self.gw_former_macs = []
 
 
 class ArpGuard:
     """Adapter: scapy sniffer (BPF `arp`) feeding the pure evaluator."""
 
-    def __init__(self, nm, events: EventStore, registry=None, intel=None):
+    def __init__(self, nm, events: EventStore, registry=None, intel=None,
+                 on_gateway_rebaseline: Optional[Callable[[str, str], None]] = None,
+                 on_threat: Optional[Callable[[Dict[str, Any]], None]] = None):
         self.nm = nm
         self.events = events
         self.registry = registry
         self.intel = intel
+        # engine callbacks (P-19 feedback loop; T-23 threat hook)
+        self.on_gateway_rebaseline = on_gateway_rebaseline
+        self.on_threat = on_threat
         self.evaluator: Optional[ArpEvaluator] = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -273,6 +365,25 @@ class ArpGuard:
                     "claiming_mac") or ev.get("evidence", {}).get("source_mac")
                 if mac:
                     self.intel.record_attack(mac, ev["kind"])
+            if self.on_threat and ev["kind"] in (
+                    "arp.gateway_spoof", "arp.own_ip_conflict",
+                    "arp.gateway_oscillation"):
+                try:
+                    self.on_threat(ev)
+                except Exception:
+                    pass
+            # P-19: legitimate gateway change — feed the new trust anchor
+            # back into the engine (re-pin + firewall rebuild), off-thread
+            # so the sniffer is never blocked by subprocess work.
+            rebaseline = ev.get("rebaseline")
+            if rebaseline and self.on_gateway_rebaseline:
+                try:
+                    threading.Thread(
+                        target=self._safe_rebaseline,
+                        args=(rebaseline["gateway_ip"], rebaseline["new_mac"]),
+                        name="nf-gw-rebaseline", daemon=True).start()
+                except Exception:
+                    pass
         # passive device bookkeeping (debounced)
         if self.registry and pkt.get("hwsrc"):
             mac = pkt["hwsrc"]
@@ -281,6 +392,14 @@ class ArpGuard:
                                               save=False)
                 self._registry_dirty = True
         return results
+
+    def _safe_rebaseline(self, gw_ip: str, new_mac: str):
+        try:
+            self.nm.set_gateway_mac(new_mac)
+            self.on_gateway_rebaseline(gw_ip, new_mac)
+            log_info(f"Gateway re-baselined to {new_mac}; protections re-applied")
+        except Exception as e:
+            log_warn(f"Gateway re-baseline callback failed: {e}")
 
     def _debounce_loop(self):
         while not self._stop.wait(5.0):
