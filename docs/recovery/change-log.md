@@ -401,3 +401,21 @@ threat model treats the router itself as potentially hostile — resolver
 *set* watching cannot see fabricated answers. Evidence:
 tests/test_dns_hijack.py (13 tests, wire format hex-verified); suite
 228 passing.
+
+2026-10-16 — **T-35** (operator surfaces, P-35) —
+What: doctor +4 checks (ICMP redirect drops present, RA drop present,
+kernel hardening parameter set count, IPv6 RA-guard decision matrix,
+DNS hijack probe wire format); --status shows the hardening parameter
+count and the IPv6 mode with the live route-based decision; the
+startup banner documents the kernel defense layer and the
+restore-on-exit contract; dashboard attack panel gained an IPv6/mitm6
+card (guard state + RA sources seen) and a DNS recommendations block
+(LAN-only resolver chain guidance), with the new protections appearing
+as chips; config.example.json now carries every key added by T-29..T-34
+(hardening, ipv6, dhcp.drop_override_targets, dns.hijack_check +
+public_resolvers, corrective sustain keys). The dashboard
+firewall-profile action forwards the current RA-guard decision so a
+profile switch cannot silently drop the RA rule. Why: capabilities
+that the operator cannot see or configure are capabilities they
+cannot trust. Evidence: live doctor run in sandbox (output in commit
+message), extended static-asset test, suite 228 passing.

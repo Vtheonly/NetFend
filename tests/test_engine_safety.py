@@ -281,8 +281,9 @@ class TestStaticAssets:
             assert needle in html, f"panel missing: {needle}"
         # required data hooks
         for i in ("ov-iface", "ov-ip", "ov-gw", "chart-throughput",
-                  "sec-events", "at-arp", "at-dhcp", "at-dns", "at-wifi",
-                  "at-defenses", "at-unavailable", "topo", "pf-cpu",
+                  "sec-events", "at-arp", "at-dhcp", "at-dns", "at-dns-rec",
+                  "at-wifi", "at-ipv6", "at-ipv6-src", "at-defenses",
+                  "at-unavailable", "topo", "pf-cpu",
                   "pf-explain", "pf-wifi"):
             assert f'id="{i}"' in html, f"element missing: {i}"
 

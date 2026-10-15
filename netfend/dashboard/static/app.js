@@ -173,6 +173,21 @@ async function refreshAttacks() {
   dns.textContent = dnsEv.length ? dnsEv.length + " alerts" : "nominal";
   dns.className = "big " + (dnsEv.length ? "warn" : "ok");
   $("at-dns-srv").textContent = (d.dns.resolvers || []).join(", ") || "—";
+  // P-34: zero-trust DNS guidance when the whole chain is the router's
+  const dnsRecs = d.dns.recommendations || [];
+  $("at-dns-rec").innerHTML = (d.dns.resolvers_lan_only && dnsRecs.length)
+    ? `<div class="obs" style="color:#e0a800">resolver chain is LAN-only (the router's DNS) — recommended:</div>`
+      + dnsRecs.map((r) => `<div class="obs">• ${esc(r)}</div>`).join("")
+    : "";
+
+  const v6 = d.ipv6 ? d.ipv6.status : {};
+  const v6Ev = d.ipv6 ? (d.ipv6.events || []) : [];
+  const ipv6El = $("at-ipv6");
+  ipv6El.textContent = v6.guard_active ? "RA guard on" : "monitoring";
+  ipv6El.className = "big " + (v6Ev.length ? "warn" : "ok");
+  $("at-ipv6-src").textContent =
+    (v6.ra_sources_seen || []).join(", ")
+    || (v6.guard_active ? "suppressed" : "none seen");
 
   const wifiEv = d.wifi_disruption.events || [];
   const wifi = $("at-wifi");

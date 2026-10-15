@@ -343,13 +343,22 @@ class DashboardServer:
         dhcp_events = [e for e in recent if e["kind"].startswith("dhcp.")]
         dns_events = [e for e in recent if e["kind"].startswith("dns.")]
         wifi_events = [e for e in recent if e["kind"].startswith("wifi.")]
+        ipv6_events = [e for e in recent if e["kind"].startswith("ipv6.")]
+        hardening = self.engine.hardener.status()
+        ipv6 = self.engine.ipv6_guard.status()
+        dns_status = self.engine.dns_guard.status()
         return {
             "arp": arp_status,
             "arp_events": arp_events[:20],
             "dhcp": {"baseline": self.engine.dhcp_guard.status(),
                      "events": dhcp_events[:10]},
-            "dns": {"resolvers": self.engine.dns_guard.status()["resolvers"],
+            "dns": {"resolvers": dns_status["resolvers"],
+                    "resolvers_lan_only": dns_status.get(
+                        "resolvers_lan_only", False),
+                    "recommendations": dns_status.get("recommendations", []),
                     "events": dns_events[:10]},
+            "ipv6": {"status": ipv6, "events": ipv6_events[:10]},
+            "kernel_hardening": hardening,
             "wifi_disruption": {"events": wifi_events[:10],
                                 "monitor_mode": self.engine.wifi.status().get(
                                     "monitor_mode_capable", False)},
@@ -357,9 +366,13 @@ class DashboardServer:
                 "static_gateway_pin": arp_status["gateway_pinned"],
                 "nftables_arp_filter": self.engine.firewall.applied,
                 "nftables_input_filter": self.engine.firewall.applied,
+                "kernel_sysctl_hardening": hardening.get("active", False),
+                "ipv6_ra_guard": ipv6.get("guard_active", False),
+                "icmp_redirect_drops": self.engine.firewall.applied,
                 "arp_inspection": self.engine.arp_guard.available(),
                 "dhcp_inspection": self.engine.dhcp_guard.available(),
-                "dns_watch": self.engine.dns_guard.status()["watching"],
+                "dns_watch": dns_status["watching"],
+                "dns_hijack_check": dns_status["watching"],
                 "corrective_defense": self.engine.active_defense.status(),
             },
             "unavailable_protections": self._unavailable_protections(),
@@ -401,7 +414,8 @@ class DashboardServer:
                 return (400, {"error": f"profile must be one of {_VALID_PROFILES}"})
             from netfend.utils.config import set_config
             set_config("firewall", "profile", profile)
-            ok = self.engine.firewall.apply()
+            ok = self.engine.firewall.apply(
+                ra_guard=bool(self.engine.ipv6_guard.guard_active))
             msg = f"firewall profile set to {profile}"
             if not ok:
                 msg += " (apply deferred — see events)"

@@ -13,6 +13,19 @@
     "strict_allowed_tcp_ports": [],
     "strict_allowed_udp_ports": [53, 67, 68]
   },
+  "hardening": {
+    "enabled": true,
+    "rp_filter": "strict",
+    "restore_on_stop": true
+  },
+  "ipv6": {
+    "enabled": true,
+    "ra_guard": "auto",
+    "detect_ra_conflicts": true,
+    "ra_conflict_window_s": 60,
+    "ra_conflict_max_sources": 1,
+    "ra_conflict_cooldown_s": 300
+  },
   "arp": {
     "gateway_confirmations": 2,
     "gateway_confirm_window_s": 60,
@@ -22,7 +35,18 @@
     "oscillation_min_transitions": 6,
     "corrective_arp_enabled": true,
     "corrective_arp_max": 5,
-    "corrective_arp_cooldown_s": 60
+    "corrective_arp_cooldown_s": 60,
+    "corrective_sustain_window_s": 12,
+    "corrective_sustain_interval_s": 5,
+    "corrective_packets_per_minute": 30
+  },
+  "dhcp": {
+    "learn_observations": 2,
+    "drop_override_targets": true
+  },
+  "dns": {
+    "hijack_check": true,
+    "public_resolvers": ["1.1.1.1", "9.9.9.9"]
   },
   "dashboard": {
     "enabled": true,

@@ -28,6 +28,18 @@ from netfend.utils.config import BLACKLIST_FILE, load_config, cfg
 from netfend.utils.logging import log_info, log_err, log_success, log_warn
 
 
+def _has_ipv6_route():
+    """Best-effort IPv6 default-route probe for --status display."""
+    try:
+        import subprocess
+        r = subprocess.run(["ip", "-6", "route"], capture_output=True,
+                           text=True, timeout=5)
+        return any(line.startswith("default")
+                   for line in r.stdout.splitlines())
+    except Exception:
+        return False
+
+
 def cmd_status():
     from netfend.services.defense_engine import DefenseEngine
     from netfend.utils import capabilities
@@ -50,6 +62,15 @@ def cmd_status():
     from netfend.utils.config import DATA_DIR
     print(f"  data dir  : {DATA_DIR}")
     print(f"  dry_run   : {cfg('general', 'dry_run')}")
+    try:
+        from netfend.services.hardening import build_param_list
+        n_params = len(build_param_list(str(cfg("hardening", "rp_filter", "strict"))))
+        print(f"  hardening : {n_params} kernel params enforced when root "
+              f"(rp_filter={cfg('hardening', 'rp_filter', 'strict')})")
+    except Exception:
+        pass
+    v6 = "suppress RAs" if not _has_ipv6_route() else "monitor RA sources"
+    print(f"  ipv6      : {cfg('ipv6', 'ra_guard', 'auto')} — will {v6}")
     print("-" * 60)
     print("  capabilities:")
     for note in caps["notes"] or ["all capabilities present"]:
@@ -108,13 +129,45 @@ def cmd_doctor():
             cfg("firewall", "icmp_rate_per_s", 20),
             cfg("firewall", "icmp_burst", 40),
             cfg("firewall", "strict_allowed_tcp_ports", []),
-            cfg("firewall", "strict_allowed_udp_ports", [53, 67, 68]))
+            cfg("firewall", "strict_allowed_udp_ports", [53, 67, 68]),
+            ra_guard=True)
         check("ruleset generation", "netfend_filter" in rs, f"{len(rs.splitlines())} lines")
+        check("icmp redirect drops present", "redirect counter drop" in rs
+              and "nd-redirect counter drop" in rs, "v4+v6 route-hijack vector")
+        check("IPv6 RA drop present (when guard active)",
+              "nd-router-advert counter drop" in rs, "mitm6 vector")
         arp = build_arp_ruleset("192.0.2.10", "00:11:22:33:44:55",
                                 "192.0.2.1", "00:11:22:33:44:99")
         check("arp ruleset generation", "netfend_arp" in arp, "")
     except Exception as e:
         check("ruleset generation", False, str(e))
+
+    # kernel hardening + IPv6 guard sanity (dry, no kernel touch)
+    try:
+        from netfend.services.hardening import build_param_list
+        params = build_param_list(str(cfg("hardening", "rp_filter", "strict")))
+        check("kernel hardening parameter set", len(params) >= 11,
+              f"{len(params)} sysctls (redirects, source-route, rp_filter "
+              f"'{cfg('hardening', 'rp_filter', 'strict')}')")
+    except Exception as e:
+        check("kernel hardening parameter set", False, str(e))
+    try:
+        from netfend.services.ipv6_guard import should_enable_ra_guard
+        ok = (should_enable_ra_guard(False, "auto") is True
+              and should_enable_ra_guard(True, "auto") is False
+              and should_enable_ra_guard(None, "auto") is False)
+        check("IPv6 RA guard decision logic", ok,
+              f"mode={cfg('ipv6', 'ra_guard', 'auto')} (auto: suppress only "
+              "when no IPv6 default route)")
+    except Exception as e:
+        check("IPv6 RA guard decision logic", False, str(e))
+    try:
+        from netfend.services.dns_guard import build_dns_query, parse_dns_response
+        q = build_dns_query("netfend-doctor.invalid")
+        check("DNS hijack probe wire format", len(q) > 12 and q[-4:] == b"\x00\x01\x00\x01",
+              "NXDOMAIN ground-truth check armed")
+    except Exception as e:
+        check("DNS hijack probe wire format", False, str(e))
 
     # state files
     from netfend.utils.config import DATA_DIR
@@ -250,9 +303,12 @@ def run_service():
               f"({snap['gateway_mac'] or 'resolving...'})")
         print(f"  Dashboard  : http://127.0.0.1:{dashboard.port}/  (localhost only)")
         print(f"  Token file : {DASHBOARD_TOKEN_FILE}")
+        print("  Kernel     : sysctl hardening (redirects off, source-route off,")
+        print("               rp_filter strict) + nftables drops (invalid, floods,")
+        print("               ICMP redirects, rogue RAs when v4-only) — restored on exit")
         print("  Engine     : idle-silent defense; corrective actions only on")
-        print("               confirmed threats (bounded, see ADR-006)")
-        print("  Stop       : press Ctrl+C — kernel state is cleaned up")
+        print("               confirmed threats (bounded + airtime-budgeted, ADR-006)")
+        print("  Stop       : press Ctrl+C — kernel state is cleaned up, no flapping")
         print()
         engine.run_forever()
     except KeyboardInterrupt:
