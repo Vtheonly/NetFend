@@ -116,10 +116,15 @@ async function refreshSecurity() {
     <div class="kv"><span>DNS events</span><b>${c.dns}</b></div>
     <div class="kv"><span>Wi-Fi events</span><b>${c.wifi}</b></div>`;
   $("sec-threats").innerHTML = d.threats.length
-    ? d.threats.map((t) => `<div class="kv"><span>${esc(t.mac)}<br>
+    ? d.threats.map((t) => {
+        const lvl = t.effective_threat_level || t.threat_level;
+        const stale = t.stale
+          ? ` <small title="no activity for ${t.stale_days} d — level decayed">(stale ${Math.round(t.stale_days)}d)</small>` : "";
+        return `<div class="kv"><span>${esc(t.mac)}<br>
         <small>${esc(t.techniques.join(", "))}</small></span>
-        <b class="sev-${t.threat_level === "HOSTILE" || t.threat_level === "CRITICAL" ? "critical" : "warning"}">
-        ${t.threat_level} (${t.total_attacks})</b></div>`).join("")
+        <b class="sev-${lvl === "HOSTILE" || lvl === "CRITICAL" ? "critical" : "warning"}">
+        ${lvl} (${t.total_attacks})${stale}</b></div>`;
+      }).join("")
     : "No known hostile profiles.";
 
   const qs = new URLSearchParams();

@@ -110,21 +110,32 @@ class ThreatIntelligence:
         return profile
 
     def get_threat_level(self, mac: str) -> Optional[str]:
+        """Effective (age-decayed) threat level — P-25."""
         mac = mac.lower()
         with self._lock:
             if mac in self.profiles:
-                return self.profiles[mac].threat_level
+                return self.profiles[mac].effective_level()
         return None
 
     def summary(self) -> List[Dict[str, Any]]:
-        """Dashboard/CLI view of known hostile profiles."""
+        """Dashboard/CLI view of known hostile profiles.
+
+        P-25: entries carry the age-decayed effective level plus a stale
+        marker; active (recent) threats sort before historical ones so a
+        months-old profile with a huge counter cannot dominate the panel.
+        """
+        from datetime import datetime as _dt
+        now = _dt.now()
         with self._lock:
-            out = []
-            for mac, p in sorted(self.profiles.items(),
-                                  key=lambda x: x[1].total_attacks, reverse=True):
-                out.append({
+            entries = []
+            for mac, p in self.profiles.items():
+                stale_days = round(p.days_since_last_seen(now), 1)
+                entries.append({
                     "mac": mac,
                     "threat_level": p.threat_level,
+                    "effective_threat_level": p.effective_level(now),
+                    "stale": p.is_stale(now),
+                    "stale_days": stale_days,
                     "total_attacks": p.total_attacks,
                     "techniques": sorted(p.techniques),
                     "spoofed_ips": sorted(p.spoofed_ips),
@@ -132,13 +143,20 @@ class ThreatIntelligence:
                     "last_seen": p.last_seen,
                     "notes": list(p.notes),
                 })
-            return out
+            # active threats first (most recently seen first), then stale
+            # ones (least-stale first); counters break ties — a months-old
+            # profile cannot dominate the panel regardless of its counter
+            entries.sort(key=lambda e: (e["stale"], e["stale_days"],
+                                        -e["total_attacks"]))
+            return entries
 
     def get_status_report(self) -> List[str]:
         """Legacy text report (kept for CLI compatibility)."""
         return [
-            f"  {r['mac']}  | {r['threat_level']:8s} | {r['total_attacks']:4d} attacks | "
+            f"  {r['mac']}  | {r['effective_threat_level']:8s} | "
+            f"{r['total_attacks']:4d} attacks | "
             f"techniques: {', '.join(r['techniques'])} | last: {r['last_seen']}"
+            + (f" | STALE {r['stale_days']}d" if r["stale"] else "")
             for r in self.summary()
         ]
 

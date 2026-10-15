@@ -4,6 +4,14 @@ from datetime import datetime, timedelta
 from typing import List, Set, Dict, Any, Optional
 from netfend.utils.config import THREAT_MONITOR, THREAT_HIERARCHY, ESCALATION_RULES
 
+# Aging tiers (P-25): inactivity decays the DISPLAYED and DECISION level.
+# Stored history is never rewritten — an attacker returning simply
+# re-escalates through fresh attacks.
+STALE_DAYS = 14          # one level down
+VERY_STALE_DAYS = 30     # two levels down
+ANCIENT_DAYS = 60        # down to MONITOR
+
+
 class ThreatProfile:
     """Tracks behavioral data for a single attacker identity."""
 
@@ -18,6 +26,41 @@ class ThreatProfile:
         self.burst_intervals: List[float] = []          # Time deltas between consecutive attacks (fingerprint)
         self.total_attacks = 0
         self.notes: List[str] = []
+
+    # -- aging (P-25) -----------------------------------------------------------
+    def days_since_last_seen(self, now: Optional[datetime] = None) -> float:
+        try:
+            last = datetime.fromisoformat(self.last_seen)
+            return max(0.0, ((now or datetime.now()) - last).total_seconds() / 86400.0)
+        except (ValueError, TypeError):
+            return 0.0
+
+    def effective_level(self, now: Optional[datetime] = None) -> str:
+        """Stored threat level decayed by inactivity.
+
+        Live-fire context (report.md 2026-10-15): a profile from June with
+        63k recorded 'attacks' still displayed CRITICAL in October and
+        dominated the dashboard. A stale attacker is history, not an
+        active threat: 14 d silent -> one level down, 30 d -> two, 60 d ->
+        MONITOR. Fresh activity immediately restores the stored level.
+        """
+        try:
+            idx = THREAT_HIERARCHY.index(self.threat_level)
+        except ValueError:
+            return THREAT_MONITOR
+        days = self.days_since_last_seen(now)
+        if days >= ANCIENT_DAYS:
+            decay = 3
+        elif days >= VERY_STALE_DAYS:
+            decay = 2
+        elif days >= STALE_DAYS:
+            decay = 1
+        else:
+            decay = 0
+        return THREAT_HIERARCHY[max(0, idx - decay)]
+
+    def is_stale(self, now: Optional[datetime] = None) -> bool:
+        return self.days_since_last_seen(now) >= STALE_DAYS
 
     def record_attack(self, technique: str, spoofed_ip: Optional[str] = None) -> bool:
         """Records an attack event and returns True if threat level escalated."""

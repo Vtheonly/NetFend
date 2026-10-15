@@ -375,6 +375,49 @@ class TestThreatProfile:
         assert p.exists()
 
 
+class TestThreatAging:
+    """P-25: the June profile with 63k attacks must not read CRITICAL
+    in October — inactivity decays the effective level."""
+
+    def _aged_profile(self, days, stored_level="CRITICAL"):
+        from datetime import datetime, timedelta
+        from netfend.models.threat_profile import ThreatProfile
+        p = ThreatProfile("d8:3b:bf:2c:a2:b3")
+        p.threat_level = stored_level
+        p.total_attacks = 63833
+        p.last_seen = (datetime.now() - timedelta(days=days)).isoformat()
+        return p
+
+    def test_fresh_profile_undecayed(self):
+        assert self._aged_profile(1).effective_level() == "CRITICAL"
+        assert not self._aged_profile(1).is_stale()
+
+    def test_stale_tiers(self):
+        from netfend.models.threat_profile import ThreatProfile
+        assert self._aged_profile(20).effective_level() == "HOSTILE"   # 1 level
+        assert self._aged_profile(45).effective_level() == "SUSPECT"   # 2 levels
+        assert self._aged_profile(100).effective_level() == "MONITOR"  # floor
+        assert self._aged_profile(20).is_stale()
+
+    def test_monitor_never_decays_below_floor(self):
+        assert self._aged_profile(365, stored_level="MONITOR").effective_level() == "MONITOR"
+
+    def test_summary_sorts_active_before_stale(self, tmp_path):
+        from datetime import datetime, timedelta
+        intel = ThreatIntelligence(path=tmp_path / "b.json")
+        old = intel.record_attack("d8:3b:bf:2c:a2:b3", "gateway_spoof")
+        old.total_attacks = 63833
+        old.last_seen = (datetime.now() - timedelta(days=110)).isoformat()
+        new = intel.record_attack("1c:73:e2:58:77:17", "gateway_spoof")
+        new.last_seen = datetime.now().isoformat()
+        s = intel.summary()
+        assert s[0]["mac"] == "1c:73:e2:58:77:17"   # active first
+        assert s[-1]["stale"] is True
+        assert s[-1]["effective_threat_level"] == "MONITOR"
+        # decision API applies aging too
+        assert intel.get_threat_level("d8:3b:bf:2c:a2:b3") == "MONITOR"
+
+
 class TestDeviceRegistry:
     def test_register_and_authorize(self, tmp_path):
         r = DeviceRegistry(path=tmp_path / "d.json")
