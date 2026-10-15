@@ -67,6 +67,82 @@ class TestDhcpEvaluator:
         assert ev.evaluate(self.obs(msg="discover"), now + 2) == []
 
 
+class TestDhcpP23:
+    """P-23 live-fire regressions: 0.0.0.0 siaddr + mesh infra false flag."""
+
+    def obs(self, server_ip="192.168.100.1", server_mac="1c:73:e2:57:f1:39",
+            server_id=None, msg="offer", router="192.168.100.1",
+            your_ip="192.168.100.131"):
+        return {"server_ip": server_ip, "server_mac": server_mac,
+                "message_type": msg, "your_ip": your_ip,
+                "options": {"router": router, "dns": ["192.168.100.1"],
+                            "server_id": server_id}}
+
+    def test_zero_siaddr_keys_on_mac_not_ip(self):
+        """Live case: 'Unexpected DHCP server 0.0.0.0 (1c:73:e2:57:f1:39)'
+        — siaddr 0.0.0.0 must never become the server identity."""
+        ev = DhcpEvaluator()
+        key = ev.server_key(self.obs(server_ip="0.0.0.0", server_id=None))
+        assert "0.0.0.0" not in key
+        assert "1c:73:e2:57:f1:39" in key
+
+    def test_option54_preferred_over_siaddr(self):
+        ev = DhcpEvaluator()
+        key = ev.server_key(self.obs(server_ip="0.0.0.0",
+                                     server_id="192.168.100.1"))
+        assert key.startswith("192.168.100.1|")
+
+    def test_mesh_infra_not_rogue(self):
+        """A server identifying as the gateway and offering that gateway as
+        router is infrastructure (mesh node), learned with a notice."""
+        ev = DhcpEvaluator(gateway={"ip": "192.168.100.1",
+                                    "macs": ["1c:73:e2:58:77:17"]})
+        ev.learn_observations = 2
+        now = 1000.0
+        # primary router learned during the learning window
+        ev.evaluate(self.obs(server_ip="192.168.100.1",
+                             server_mac="1c:73:e2:58:77:17",
+                             server_id="192.168.100.1"), now)
+        ev.evaluate(self.obs(server_ip="192.168.100.1",
+                             server_mac="1c:73:e2:58:77:17",
+                             server_id="192.168.100.1"), now + 1)
+        # mesh node answers under the same gateway identity => infra, notice
+        out = ev.evaluate(self.obs(), now + 2)
+        kinds = [e["kind"] for e in out]
+        assert "dhcp.infra_server" in kinds
+        assert "dhcp.rogue_server" not in kinds
+        assert all(e["severity"] != "critical" for e in out)
+        # learned: subsequent offers from it are silent
+        assert ev.evaluate(self.obs(), now + 3) == []
+
+    def test_real_rogue_still_critical(self):
+        """A server NOT matching the gateway identity stays a rogue alert."""
+        ev = DhcpEvaluator(gateway={"ip": "192.168.100.1",
+                                    "macs": ["1c:73:e2:58:77:17"]})
+        ev.learn_observations = 2
+        now = 1000.0
+        ev.evaluate(self.obs(server_mac="1c:73:e2:58:77:17"), now)
+        ev.evaluate(self.obs(server_mac="1c:73:e2:58:77:17"), now + 1)
+        out = ev.evaluate(self.obs(server_ip="6.6.6.6",
+                                   server_mac="de:ad:be:ef:00:99",
+                                   server_id="6.6.6.6",
+                                   router="6.6.6.6"), now + 2)
+        assert any(e["kind"] == "dhcp.rogue_server"
+                   and e["severity"] == "critical" for e in out)
+
+    def test_baseline_persistence_roundtrip(self, tmp_path):
+        import json
+        ev = DhcpEvaluator()
+        ev.learn_observations = 1
+        ev.evaluate(self.obs(), 1000.0)
+        p = tmp_path / "dhcp_baseline.json"
+        p.write_text(json.dumps(ev.to_persist()))
+        # a fresh evaluator (engine restart) must not re-learn/re-flag
+        ev2 = DhcpEvaluator()
+        ev2.load_persisted(json.loads(p.read_text()))
+        assert ev2.evaluate(self.obs(), 2000.0) == []
+
+
 class TestDnsEvaluator:
     def test_parse_resolv_conf(self):
         content = ("# comment\n"
