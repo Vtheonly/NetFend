@@ -53,6 +53,8 @@ fi
 # 5) Remove files
 log "Removing files..."
 rm -f /usr/local/bin/netfend
+rm -f /usr/local/bin/net_protect /usr/local/bin/net_reset \
+      /usr/local/bin/net_watch /usr/local/bin/net_blacklist
 rm -rf /opt/netfend
 rm -rf /etc/netfend
 

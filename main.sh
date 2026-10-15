@@ -22,10 +22,13 @@ NetFend installer (compatibility wrapper)
   ./main.sh install    -> runs install.sh (safe installer, supports --dry-run/--check)
   ./main.sh uninstall  -> runs uninstall.sh (complete removal, supports --keep-data)
 
-Legacy commands map to the new CLI:
-  net_protect   -> sudo systemctl start netfend   (or: sudo netfend)
+Single entry (installed):
+  sudo netfend         -> engine + dashboard in the foreground, Ctrl+C stops
+
+Legacy commands map to the modern engine (installed as launchers):
+  net_protect   -> sudo netfend            (same single entry)
   net_watch     -> netfend --status / dashboard http://127.0.0.1:8787
-  net_reset     -> sudo systemctl stop netfend    (NO interface bouncing anymore)
+  net_reset     -> systemctl stop netfend  (NO interface bouncing anymore)
   net_blacklist -> netfend --blacklist
 EOF
     ;;

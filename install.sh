@@ -19,6 +19,10 @@ UNIT_SRC="$SCRIPT_DIR/systemd/netfend.service"
 UNIT_DST="/etc/systemd/system/netfend.service"
 CLI_SRC="$SCRIPT_DIR/net_defender.py"
 CLI_LINK="/usr/local/bin/netfend"
+LEGACY_LAUNCHER_SRC="$SCRIPT_DIR/scripts/legacy-launchers.sh"
+# names the legacy installer used to drop into /usr/local/bin (P-26)
+LEGACY_CLI="/usr/local/bin/net_defender.py"
+LEGACY_NAMES="net_protect net_reset net_watch net_blacklist"
 
 DRY_RUN=0
 CHECK_ONLY=0
@@ -124,6 +128,22 @@ install_files() {
   fi
 }
 
+install_legacy_compat() {
+  # P-26: the owner launches protection with `net_protect` — keep that
+  # workflow, but backed by the modern engine (single entry: sudo netfend).
+  log "Installing legacy-compatible launchers..."
+  for name in $LEGACY_NAMES; do
+    run install -m 755 "$LEGACY_LAUNCHER_SRC" "/usr/local/bin/$name"
+  done
+  # Disable the LEGACY engine binary so old muscle memory cannot run the
+  # unsafe code (timer-driven ARP blasts, arptables -F, stop-crash).
+  if [ -f "$LEGACY_CLI" ] && ! cmp -s "$LEGACY_CLI" "$INSTALL_DIR/net_defender.py"; then
+    run mv "$LEGACY_CLI" "${LEGACY_CLI}.legacy-disabled"
+    warn "legacy engine moved aside: $LEGACY_CLI -> ${LEGACY_CLI}.legacy-disabled"
+    warn "  (it violates ADR-001/002; `net_protect` now launches the modern engine)"
+  fi
+}
+
 install_service() {
   if [ "$NO_SERVICE" = "1" ]; then
     log "Skipping systemd service (--no-service)."
@@ -177,6 +197,7 @@ rollback() {
     [ -n "$m" ] && rm -rf "$m"
   done
   rm -f "$UNIT_DST" "$CLI_LINK"
+  for name in $LEGACY_NAMES; do rm -f "/usr/local/bin/$name"; done
   systemctl daemon-reload 2>/dev/null || true
 }
 
@@ -193,6 +214,9 @@ main() {
   # CLI symlink
   run ln -sf "$INSTALL_DIR/net_defender.py" "$CLI_LINK"
 
+  # legacy-compatible launchers (net_protect & friends -> modern engine)
+  install_legacy_compat
+
   # dashboard token (created by engine on first start if absent)
 
   install_service
@@ -202,14 +226,17 @@ main() {
   echo "  ================================================"
   echo "   NetFend installation complete"
   echo "  ================================================"
-  echo "   CLI:            sudo netfend --status"
-  echo "                   sudo netfend --doctor"
-  echo "                   sudo netfend --events 20"
-  echo "   Service:        systemctl status netfend"
-  echo "   Dashboard:      http://127.0.0.1:8787/  (localhost only)"
-  echo "   Token file:     $DATA_DIR/dashboard.token (chmod 600)"
-  echo "   Config:         $CONFIG_DIR/config.json"
-  echo "   Uninstall:      sudo ./uninstall.sh"
+  echo "   Single entry:    sudo netfend        (engine + dashboard, Ctrl+C stops)"
+  echo "   Legacy names:    net_protect         (same as sudo netfend)"
+  echo "                    net_reset           (safe stop — no interface bouncing)"
+  echo "                    net_watch           (status + dashboard URL)"
+  echo "                    net_blacklist       (threat profiles)"
+  echo "   CLI:             sudo netfend --status / --doctor / --events 20"
+  echo "   Service:         systemctl status netfend"
+  echo "   Dashboard:       http://127.0.0.1:8787/  (localhost only)"
+  echo "   Token file:      $DATA_DIR/dashboard.token (chmod 600)"
+  echo "   Config:          $CONFIG_DIR/config.json"
+  echo "   Uninstall:       sudo ./uninstall.sh"
   echo "  ================================================"
 }
 

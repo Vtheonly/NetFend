@@ -94,10 +94,34 @@ class TestEngineSafetyInvariants:
         """RC-7: nothing may down/up interfaces to 'fix' connectivity."""
         for f in list(PKG.rglob("*.py")) + [ROOT / "install.sh",
                                             ROOT / "uninstall.sh",
-                                            ROOT / "scripts" / "cleanup.sh"]:
+                                            ROOT / "scripts" / "cleanup.sh",
+                                            ROOT / "scripts" / "legacy-launchers.sh",
+                                            ROOT / "main.sh"]:
             if f.exists():
                 src = f.read_text()
                 assert "link set" not in src, f"{f} bounces interfaces"
+
+    def test_legacy_launchers_target_modern_engine(self):
+        """P-26: net_protect & friends must launch /usr/local/bin/netfend
+        (the modern engine), never the archived legacy code."""
+        launcher = ROOT / "scripts" / "legacy-launchers.sh"
+        src = launcher.read_text()
+        assert "/usr/local/bin/netfend" in src
+        assert "net_defender.py --blacklist" not in src  # legacy invocation
+        # every legacy name is handled
+        for name in ("net_protect", "net_reset", "net_watch", "net_blacklist"):
+            assert name in src
+
+    def test_installer_installs_launchers_and_disables_legacy(self):
+        """P-26: install.sh must deploy the launchers and move the legacy
+        binary aside; uninstall.sh must remove them."""
+        install = (ROOT / "install.sh").read_text()
+        uninstall = (ROOT / "uninstall.sh").read_text()
+        for name in ("net_protect", "net_reset", "net_watch", "net_blacklist"):
+            assert name in install, f"installer missing launcher {name}"
+            assert name in uninstall, f"uninstaller missing launcher {name}"
+        assert "legacy-disabled" in install
+        assert "legacy-launchers.sh" in install
 
     def test_engine_threads_are_daemons(self):
         from netfend.services.defense_engine import DefenseEngine

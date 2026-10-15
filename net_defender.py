@@ -215,20 +215,51 @@ def cmd_blacklist_show(intel):
 
 
 def run_service():
-    """Foreground engine run (used by systemd and manual start)."""
+    """Foreground engine run (used by systemd and manual start).
+
+    This is the single entry point (`sudo netfend` / `sudo net_protect`):
+    engine + dashboard together, one terminal, Ctrl+C to stop cleanly.
+    """
     from netfend.services.defense_engine import DefenseEngine
     from netfend.dashboard.server import DashboardServer
+    from netfend.utils.config import DASHBOARD_TOKEN_FILE
     load_config()
+
+    if os.geteuid() != 0:
+        print("NetFend protects this machine through kernel state (nftables,")
+        print("static neighbor entries). That needs root.")
+        print()
+        print("  sudo netfend            run the defense engine (foreground)")
+        print("  netfend --doctor        check capabilities without root")
+        print("  netfend --status        show a status snapshot")
+        return
+
     engine = DefenseEngine()
     dashboard = DashboardServer(engine, engine.events)
     engine.dashboard = dashboard
     engine.start()
+    snap = engine.nm.snapshot()
     try:
+        print()
+        print("╔══════════════════════════════════════════════╗")
+        print("║   NetFend — Network Defense Engine (live)   ║")
+        print("╚══════════════════════════════════════════════╝")
+        print(f"  Interface  : {snap['interface']}")
+        print(f"  This host  : {snap['my_ip']}  ({snap['my_mac']})")
+        print(f"  Gateway    : {snap['gateway_ip']}  "
+              f"({snap['gateway_mac'] or 'resolving...'})")
+        print(f"  Dashboard  : http://127.0.0.1:{dashboard.port}/  (localhost only)")
+        print(f"  Token file : {DASHBOARD_TOKEN_FILE}")
+        print("  Engine     : idle-silent defense; corrective actions only on")
+        print("               confirmed threats (bounded, see ADR-006)")
+        print("  Stop       : press Ctrl+C — kernel state is cleaned up")
+        print()
         engine.run_forever()
     except KeyboardInterrupt:
-        pass
+        print()
     finally:
         engine.stop()
+        print("Defense deactivated. Engine-owned kernel state removed.")
 
 
 def main():

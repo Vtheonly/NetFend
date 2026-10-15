@@ -93,13 +93,38 @@ The installer:
   and a 30 s watchdog
 - **verifies the service actually starts; rolls the whole install back
   if it doesn't**
+- installs the `netfend` command plus legacy-name launchers
+  (`net_protect`, `net_reset`, `net_watch`, `net_blacklist`) that all
+  point at the MODERN engine — and moves any legacy
+  `/usr/local/bin/net_defender.py` aside as `*.legacy-disabled`
 - generates the dashboard token at `/var/lib/netfend/dashboard.token`
   (mode 0600)
+
+## Single entry point (how to launch it)
+
+One command runs everything — engine + dashboard, in the foreground,
+Ctrl+C stops cleanly and removes all engine-owned kernel state:
+
+```bash
+sudo netfend
+```
+
+The old muscle-memory names keep working and map to the same engine:
+
+| Command | What it does now |
+|---|---|
+| `net_protect` | same as `sudo netfend` (single entry, foreground) |
+| `net_reset` | safe stop — systemctl stop / SIGTERM, **no interface bouncing** |
+| `net_watch` | status snapshot + dashboard URL |
+| `net_blacklist` | threat profiles (with age decay markers) |
+
+The legacy engine under `old/` is archived reference only — see
+`old/README.md` for why it must never be executed.
 
 ### Manual run (no systemd)
 
 ```bash
-sudo python3 net_defender.py            # foreground
+sudo python3 net_defender.py            # foreground (same as sudo netfend)
 sudo python3 net_defender.py --dry-run  # diagnostics only, no kernel changes
 ```
 
