@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetFend — Network Defense</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">Net<span>Fend</span></div>
+  <div class="sub">Network Defense Engine &amp; Monitoring</div>
+  <div id="conn-badge" class="badge offline">connecting…</div>
+</header>
+
+<nav>
+  <button class="tab active" data-panel="overview">Network Overview</button>
+  <button class="tab" data-panel="security">Security Monitoring</button>
+  <button class="tab" data-panel="attacks">Local Network Attack Protection</button>
+  <button class="tab" data-panel="topology">Topology</button>
+  <button class="tab" data-panel="performance">Performance &amp; Diagnostics</button>
+</nav>
+
+<main>
+<!-- ======================= OVERVIEW ======================= -->
+<section id="panel-overview" class="panel active">
+  <div class="grid cards">
+    <div class="card"><h3>Interface</h3><div id="ov-iface" class="big">—</div>
+      <div class="kv"><span>Connection</span><b id="ov-conn">—</b></div></div>
+    <div class="card"><h3>Local IP</h3><div id="ov-ip" class="big">—</div>
+      <div class="kv"><span>MAC</span><b id="ov-mac">—</b></div></div>
+    <div class="card"><h3>Gateway</h3><div id="ov-gw" class="big">—</div>
+      <div class="kv"><span>Gateway MAC</span><b id="ov-gwmac">—</b></div></div>
+    <div class="card"><h3>Health</h3><div id="ov-health" class="big ok">—</div>
+      <div class="kv"><span>Wi-Fi</span><b id="ov-wifi">—</b></div></div>
+  </div>
+  <div class="card wide">
+    <h3>Throughput <small>(last minutes)</small></h3>
+    <canvas id="chart-throughput" width="900" height="200"></canvas>
+    <div class="legend"><span class="dot rx"></span>Download
+      <span class="dot tx"></span>Upload
+      <span id="ov-rate" class="rate"></span></div>
+  </div>
+  <div class="card wide" id="ov-explain">
+    <h3>Connection health verdict</h3>
+    <p id="ov-verdict">Waiting for measurements…</p>
+  </div>
+</section>
+
+<!-- ======================= SECURITY ======================= -->
+<section id="panel-security" class="panel">
+  <div class="grid cards">
+    <div class="card"><h3>Firewall</h3>
+      <div id="sec-fw" class="big">—</div>
+      <div class="kv"><span>Profile</span><b id="sec-fw-profile">—</b></div>
+      <div class="kv"><span>Dropped (packets)</span><b id="sec-fw-drops">—</b></div>
+    </div>
+    <div class="card"><h3>Detections (24 h)</h3>
+      <div id="sec-counts" class="counts"></div></div>
+    <div class="card"><h3>Threat profiles</h3>
+      <div id="sec-threats" class="mini-list">No known hostile profiles.</div></div>
+  </div>
+  <div class="card wide">
+    <h3>Event log</h3>
+    <div class="filters">
+      <select id="f-severity">
+        <option value="">any severity</option>
+        <option value="info">info+</option>
+        <option value="notice">notice+</option>
+        <option value="warning">warning+</option>
+        <option value="critical">critical</option>
+      </select>
+      <select id="f-kind">
+        <option value="">any type</option>
+        <option value="arp">ARP</option>
+        <option value="dhcp">DHCP</option>
+        <option value="dns">DNS</option>
+        <option value="wifi">Wi-Fi</option>
+        <option value="firewall">Firewall</option>
+        <option value="network">Network</option>
+        <option value="engine">Engine</option>
+      </select>
+      <select id="f-iface"><option value="">any interface</option></select>
+      <input id="f-search" type="text" placeholder="search text…">
+    </div>
+    <div id="sec-events" class="event-table"></div>
+  </div>
+</section>
+
+<!-- ======================= ATTACK PROTECTION ======================= -->
+<section id="panel-attacks" class="panel">
+  <div class="grid cards">
+    <div class="card"><h3>ARP / Gateway integrity</h3>
+      <div id="at-arp" class="big ok">—</div>
+      <div class="kv"><span>Gateway pin</span><b id="at-pin">—</b></div></div>
+    <div class="card"><h3>DHCP integrity</h3>
+      <div id="at-dhcp" class="big ok">—</div>
+      <div class="kv"><span>Known servers</span><b id="at-dhcp-srv">—</b></div></div>
+    <div class="card"><h3>DNS integrity</h3>
+      <div id="at-dns" class="big ok">—</div>
+      <div class="kv"><span>Resolvers</span><b id="at-dns-srv">—</b></div></div>
+    <div class="card"><h3>Wi-Fi disruption</h3>
+      <div id="at-wifi" class="big ok">—</div>
+      <div class="kv"><span>Monitor mode</span><b id="at-mon">—</b></div></div>
+  </div>
+  <div class="card">
+    <h3>Active defenses</h3><div id="at-defenses" class="chips"></div>
+    <h3>Unavailable on this hardware / environment</h3>
+    <div id="at-unavailable" class="chips warn"></div>
+  </div>
+  <div class="card wide">
+    <h3>Attack-relevant events <small>(severity &amp; confidence badges; confirmed vs suspected vs unverified)</small></h3>
+    <div id="at-events" class="event-table"></div>
+  </div>
+</section>
+
+<!-- ======================= TOPOLOGY ======================= -->
+<section id="panel-topology" class="panel">
+  <div class="card wide">
+    <h3>Observed local network</h3>
+    <p class="note">Hosts are discovered through authorized, passive observation
+      (ARP traffic and the kernel neighbor table). No device is probed or
+      accessed. Only the default route is drawn as a link — relationships
+      between other hosts are <b>not</b> claimed.</p>
+    <div id="topo" class="topo"></div>
+  </div>
+</section>
+
+<!-- ======================= PERFORMANCE ======================= -->
+<section id="panel-performance" class="panel">
+  <div class="grid cards">
+    <div class="card"><h3>Engine CPU</h3><div id="pf-cpu" class="big">—</div></div>
+    <div class="card"><h3>Engine memory</h3><div id="pf-mem" class="big">—</div></div>
+    <div class="card"><h3>Gateway latency</h3><div id="pf-rtt" class="big">—</div>
+      <div class="kv"><span>Packet loss</span><b id="pf-loss">—</b></div></div>
+    <div class="card"><h3>DNS check</h3><div id="pf-dns" class="big">—</div>
+      <div class="kv"><span>Last probe</span><b id="pf-dns-t">—</b></div></div>
+  </div>
+  <div class="card wide">
+    <h3>Packet rate</h3>
+    <canvas id="chart-pps" width="900" height="160"></canvas>
+  </div>
+  <div class="card wide">
+    <h3>Why is my internet slow?</h3>
+    <p id="pf-explain">Waiting for enough measurements…</p>
+  </div>
+  <div class="card wide">
+    <h3>Wi-Fi diagnostics</h3>
+    <div id="pf-wifi" class="kv-list"></div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <span>NetFend — read-only monitoring by default; state-changing actions require the dashboard token.</span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

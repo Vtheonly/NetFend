@@ -217,8 +217,11 @@ def cmd_blacklist_show(intel):
 def run_service():
     """Foreground engine run (used by systemd and manual start)."""
     from netfend.services.defense_engine import DefenseEngine
+    from netfend.dashboard.server import DashboardServer
     load_config()
     engine = DefenseEngine()
+    dashboard = DashboardServer(engine, engine.events)
+    engine.dashboard = dashboard
     engine.start()
     try:
         engine.run_forever()
