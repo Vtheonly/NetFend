@@ -102,6 +102,11 @@ DEFAULTS: Dict[str, Any] = {
         "rollback_cooldown_s": 300,     # after a failed apply, wait before retry
         "selfcheck_timeout_s": 6,
     },
+    "hardening": {
+        "enabled": True,                # sysctl enforcement (redirects, source-route, rp_filter)
+        "rp_filter": "strict",          # strict (1) | loose (2) | preserve — see ADR-007
+        "restore_on_stop": True,        # restore pre-engine values on engine stop
+    },
     "arp": {
         "enabled": True,
         "flap_window_s": 120,           # same IP seen with N distinct MACs within window
@@ -164,7 +169,13 @@ _config: Dict[str, Any] = {}
 
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(base)
+    """Merge overlay onto base WITHOUT sharing any nested reference with
+    base (P-31: a shallow top-level copy let runtime set_config() calls
+    mutate DEFAULTS itself, so overrides survived later load_config()
+    reloads — found live while testing the hardening wiring)."""
+    out: Dict[str, Any] = {}
+    for k, v in base.items():
+        out[k] = _deep_merge(v, {}) if isinstance(v, dict) else v
     for k, v in overlay.items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = _deep_merge(out[k], v)

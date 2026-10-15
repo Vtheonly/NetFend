@@ -230,7 +230,9 @@ class TestActiveDefense:
         from netfend.utils import capabilities
         capabilities._PROBED = {**capabilities.probe(), "root": True, "scapy": True}
         try:
-            d.handle_threat(spoof_event())
+            # no gateway MAC in the snapshot AND none in the evidence
+            d.handle_threat({"kind": "arp.own_ip_conflict",
+                             "evidence": {"claiming_mac": "de:ad:be:ef:00:03"}})
             _wait_thread()
             assert unicast == []   # gateway unknown: broadcast only
         finally:

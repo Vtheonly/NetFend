@@ -318,3 +318,24 @@ suites rotate MACs freely while their tool cadence and technique set
 stay constant — exactly what the correlator keys on. Evidence:
 tests/test_threat_intel.py (15 tests incl. non-correlation guards
 against different-cadence/different-tool profiles); suite 162 passing.
+
+2026-10-16 — **T-31** (kernel hardening, P-30) + **P-31 bug fix** —
+What: new `netfend/services/hardening.py` (ADR-007): KernelHardener
+enforces the zero-trust client sysctl set on engine start —
+accept_redirects=0 (v4+v6, all+default), secure_redirects=0,
+accept_source_route=0, send_redirects=0, icmp_echo_ignore_broadcasts=1,
+rp_filter=strict(1) by config (loose/preserve for asymmetric-routing
+setups) — via direct /proc/sys writes (stdlib only), persisting the
+pre-change values to hardening_state.json BEFORE writing and restoring
+them on engine stop. A stale state file from a crashed run is restored
+first so saved originals are always the true pre-hardening values; the
+restore path refuses any path outside net/ or containing '..'. Engine
+start applies it in _apply_protections() (between gateway pin and
+firewall); engine stop restores it next to firewall/neighbor cleanup.
+Why: the updated threat model assumes the gateway itself may be
+compromised — ICMP redirects and source routing are gateway-grade
+attacks no ARP-side defense stops. Bug found while testing: P-31 —
+_deep_merge shared nested dicts with DEFAULTS so runtime set_config()
+overrides survived config reloads; fixed with a recursive copy.
+Evidence: tests/test_hardening.py (16 tests incl. crash recovery and
+gates), TestConfigNoDefaultsPollution regressions; suite 180 passing.

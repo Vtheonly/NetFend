@@ -254,3 +254,33 @@ class TestCapabilities:
         from netfend.utils import capabilities
         s = capabilities.summary()
         assert "capabilities" in s and isinstance(s["notes"], list)
+
+
+class TestConfigNoDefaultsPollution:
+    """P-31 regression: runtime set_config() must never mutate DEFAULTS.
+
+    Found live 2026-10-16 while testing the hardening engine wiring: a
+    shallow _deep_merge let the effective config SHARE nested dicts with
+    DEFAULTS, so a set_config('general','dry_run',True) in one test (or a
+    dashboard 'reload' in production) permanently changed the defaults
+    for every later load_config() in the same process.
+    """
+
+    def test_set_config_does_not_mutate_defaults(self):
+        import copy
+        import netfend.utils.config as config_mod
+        from netfend.utils.config import DEFAULTS, load_config, set_config
+        snapshot = copy.deepcopy(DEFAULTS)
+        load_config()
+        set_config("general", "dry_run", True)
+        set_config("arp", "corrective_arp_max", 99)
+        assert DEFAULTS == snapshot, "DEFAULTS was mutated by set_config"
+
+    def test_reload_does_not_inherit_previous_overrides(self):
+        import netfend.utils.config as config_mod
+        from netfend.utils.config import load_config, set_config, cfg
+        load_config()
+        set_config("general", "dry_run", True)
+        assert cfg("general", "dry_run") is True
+        config_mod._config = {}          # simulate a config reload
+        assert load_config()["general"]["dry_run"] is False

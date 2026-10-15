@@ -23,6 +23,7 @@ from netfend.services.device_registry import DeviceRegistry
 from netfend.services.dhcp_guard import DhcpGuard
 from netfend.services.dns_guard import DnsGuard
 from netfend.services.firewall import FirewallManager
+from netfend.services.hardening import KernelHardener
 from netfend.services.metrics import MetricsCollector
 from netfend.services.network_manager import NetworkManager
 from netfend.services.threat_intelligence import ThreatIntelligence
@@ -42,6 +43,7 @@ class DefenseEngine:
         self.intel = ThreatIntelligence(events=self.events)
         self.registry = DeviceRegistry()
         self.firewall = FirewallManager(self.nm, self.events)
+        self.hardener = KernelHardener(self.events)
         self.active_defense = ActiveDefense(self.nm, self.events, self.intel)
         self.arp_guard = ArpGuard(self.nm, self.events, self.registry, self.intel,
                                   on_gateway_rebaseline=self._on_gateway_rebaseline,
@@ -113,7 +115,8 @@ class DefenseEngine:
 
     # ------------------------------------------------------- kernel protection
     def _apply_protections(self) -> None:
-        """Static gateway pin + firewall (both validated, rollback-safe)."""
+        """Static gateway pin + sysctl hardening + firewall (all validated,
+        rollback-safe, engine-owned)."""
         snap = self.nm.snapshot()
         gw_ip, gw_mac = snap["gateway_ip"], snap["gateway_mac"]
 
@@ -125,7 +128,10 @@ class DefenseEngine:
                 else:
                     log_warn("Could not pin gateway neighbor entry (check privileges)")
 
-        # 2) nftables enforcement (validates + self-checks + rolls back)
+        # 2) sysctl hardening (redirects, source-route, rp_filter) — T-31
+        self.hardener.apply()
+
+        # 3) nftables enforcement (validates + self-checks + rolls back)
         self.firewall.apply()
 
     def _on_gateway_rebaseline(self, gw_ip: str, new_mac: str) -> None:
@@ -248,6 +254,7 @@ class DefenseEngine:
         # Remove kernel state we own (never foreign rules — ADR-003)
         if not cfg("general", "dry_run"):
             self.firewall.remove()
+            self.hardener.restore()
             snap = self.nm.snapshot()
             if snap["gateway_ip"]:
                 self.nm.remove_static_neighbor(snap["gateway_ip"])
