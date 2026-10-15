@@ -146,6 +146,8 @@ DEFAULTS: Dict[str, Any] = {
         "probe_interval_s": 60,
         "probe_domain": "example.com",  # resolved via system resolver; never custom server
         "probe_timeout_s": 5,
+        "hijack_check": True,           # P-34: random .invalid label + direct ground truth
+        "public_resolvers": ["1.1.1.1", "9.9.9.9"],  # direct ground-truth probes
     },
     "wifi": {
         "enabled": True,

@@ -5,11 +5,24 @@ Detects:
   often legitimate (VPN, roaming) so severity starts at notice and
   confidence is unverified unless correlated
 - resolution failures and abnormally slow resolutions (feeds the
-  "why is my internet slow" health verdict)
+n  "why is my internet slow" health verdict)
+- NXDOMAIN hijack signatures (P-34): a random label under `.invalid`
+  (RFC 2606: guaranteed non-existent) is resolved via the SYSTEM
+  resolver and, in parallel, directly against public resolvers
+  (stdlib UDP to 1.1.1.1 / 9.9.9.9 — bypassing any local resolver). A
+  system answer where the direct ground-truth says NXDOMAIN is a
+  CONFIRMED hijack: the local resolver chain (typically the router's)
+  is fabricating records — captive portals and DNS-steering attacks.
 
-Pure evaluator + adapter. Uses only the SYSTEM resolver for probes
-(socket.getaddrinfo) — never queries a custom server, so the probe
-reflects exactly what user applications experience.
+Zero-trust recommendations (P-34): when the effective resolvers are
+  LAN-only (the router) or a hijack is detected, the guard surfaces
+  concrete guidance — encrypted DNS (DoH/DoT via systemd-resolved) or
+  direct public resolvers — bypassing the potentially compromised
+  router DNS entirely.
+
+Pure evaluator + adapter. System-resolver probes use
+socket.getaddrinfo; direct queries build the DNS wire format by hand
+(stdlib only — no scapy, no dnspython).
 
 Field-tested fix (live report 2026-10-15, problem P-24): the event
 'DNS resolver set changed [192.168.100.1, fe80::1] -> [127.0.0.53]
@@ -19,7 +32,9 @@ layer. The watch loop now resolves the stub back to the effective
 upstream servers (resolvectl) and only reports real changes; stub
 layer transitions alone produce a single informational event.
 """
+import os
 import socket
+import struct
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -32,6 +47,18 @@ RESOLV_CONF = "/etc/resolv.conf"
 RESOLVED_STUB = "127.0.0.53"   # systemd-resolved stub (P-24)
 _STUB_CACHE_S = 30.0            # resolvectl query cache during flapping
 
+# P-34: guidance shown when resolvers are LAN-only or a hijack fires
+RECOMMENDATIONS = [
+    "Switch to encrypted DNS so the router cannot read or rewrite lookups: "
+    "systemd-resolved with DNSOverTLS=yes (e.g. DNS=1.1.1.1#cloudflare-dns.com "
+    "9.9.9.9#dns.quad9.net, or your own DoH/DoT endpoint)",
+    "Or point the system directly at public resolvers: "
+    "DNS=1.1.1.1 9.9.9.9 (resolvectl / NetworkManager), bypassing the "
+    "local router's DNS entirely",
+    "Keep dhcp.dns_override protection enabled so lease-pushed local "
+    "resolvers are rejected",
+]
+
 
 def parse_resolv_conf(content: str) -> List[str]:
     """Extract nameserver lines (pure)."""
@@ -43,6 +70,38 @@ def parse_resolv_conf(content: str) -> List[str]:
             if len(parts) == 2:
                 servers.append(parts[1])
     return servers
+
+
+def is_lan_resolver(ip: str) -> bool:
+    """True for RFC1918/link-local resolver addresses (not loopback)."""
+    import ipaddress
+    try:
+        a = ipaddress.ip_address(str(ip))
+        return a.is_private and not a.is_loopback
+    except ValueError:
+        return False
+
+
+def build_dns_query(qname: str, qid: int = 0x4E46) -> bytes:
+    """Minimal recursive A-record query for `qname` (pure, stdlib).
+
+    Wire format: 12-byte header (RD=1), QNAME labels, QTYPE=A (1),
+    QCLASS=IN (1). Used for the direct public-resolver ground-truth
+    probe — no dnspython/scapy dependency.
+    """
+    header = struct.pack(">HHHHHH", qid & 0xFFFF, 0x0100, 1, 0, 0, 0)
+    qname = b"".join(bytes([len(label)]) + label.encode("ascii")
+                      for label in qname.split(".") if label) + b"\x00"
+    return header + qname + struct.pack(">HH", 1, 1)
+
+
+def parse_dns_response(data: bytes) -> Optional[Dict[str, Any]]:
+    """Parse the minimal response fields (pure): rcode + answer count."""
+    if len(data) < 12:
+        return None
+    _qid, flags, _qd, an, _ns, _ar = struct.unpack(">HHHHHH", data[:12])
+    return {"rcode": flags & 0xF, "answers": an,
+            "truncated": bool(flags & 0x0200)}
 
 
 class DnsEvaluator:
@@ -98,6 +157,47 @@ class DnsEvaluator:
                                 f"(slow resolver or packet loss)"),
                     "evidence": probe})
         return events
+
+    def evaluate_hijack(self, system_resolved: bool,
+                        direct: Optional[Dict[str, Any]],
+                        now: float) -> List[Dict[str, Any]]:
+        """P-34: NXDOMAIN-hijack classification (pure).
+
+        `system_resolved`: did the SYSTEM resolver return an address for
+        a random `.invalid` label (it must never). `direct`: the direct
+        public-resolver ground truth (None when UDP/53 is blocked).
+        """
+        if not system_resolved:
+            return []
+        key = "hijack"
+        if now - self._last_change_emitted.get(key, float("-inf")) < 300:
+            return []
+        self._last_change_emitted[key] = now
+        if direct is None:
+            return [{
+                "kind": "dns.hijack_signature",
+                "severity": "critical",
+                "confidence": "suspected",
+                "summary": ("System resolver returned an address for a "
+                            "non-existent domain (random .invalid label) — "
+                            "NXDOMAIN hijack / captive-portal signature; direct "
+                            "public-resolver check unavailable (UDP/53 blocked?), "
+                            "so not fully confirmed"),
+                "evidence": {"direct_check": "unavailable"},
+                "recommendations": list(RECOMMENDATIONS)}]
+        confirmed = direct.get("rcode") == 3 or direct.get("answers") == 0
+        return [{
+            "kind": "dns.hijack_signature",
+            "severity": "critical",
+            "confidence": "confirmed" if confirmed else "suspected",
+            "summary": ("System resolver FABRICATED an answer for a "
+                        "non-existent domain (random .invalid label) while the "
+                        "direct public-resolver ground truth says NXDOMAIN — "
+                        "the local resolver chain (typically the router's DNS) "
+                        "is manipulating responses"),
+            "evidence": {"direct_rcode": direct.get("rcode"),
+                         "direct_answers": direct.get("answers")},
+            "recommendations": list(RECOMMENDATIONS)}]
 
 
 class DnsGuard:
@@ -216,15 +316,69 @@ class DnsGuard:
 
     def _probe_loop(self):
         interval = cfg("dns", "probe_interval_s", 60)
+        while not self._stop.wait(interval):
+            self._probe_round()
+
+    def _probe_round(self):
+        """One probe cycle: sanity probe + NXDOMAIN-hijack check (P-34)."""
         domain = cfg("dns", "probe_domain", "example.com")
         timeout = cfg("dns", "probe_timeout_s", 5)
-        while not self._stop.wait(interval):
-            probe = self._probe(domain, timeout)
-            self.last_probe = probe
-            for ev in self.evaluator.evaluate_probe(probe, time.time()):
-                self.events.emit_simple(
-                    ev["kind"], ev["severity"], ev["confidence"],
-                    ev["summary"], source="dns", **ev.get("evidence", {}))
+        probe = self._probe(domain, timeout)
+        self.last_probe = probe
+        for ev in self.evaluator.evaluate_probe(probe, time.time()):
+            self.events.emit_simple(
+                ev["kind"], ev["severity"], ev["confidence"],
+                ev["summary"], source="dns", **ev.get("evidence", {}))
+        if cfg("dns", "hijack_check", True):
+            self._run_hijack_check(timeout)
+
+    def _run_hijack_check(self, timeout: float) -> None:
+        """P-34: resolve a random `.invalid` label through the SYSTEM
+        resolver and against a public resolver directly; a system answer
+        is a fabrication (the TLD is reserved non-existent)."""
+        label = f"netfend-{os.urandom(4).hex()}.invalid"
+        try:
+            socket.setdefaulttimeout(timeout)
+            socket.getaddrinfo(label, None, socket.AF_INET)
+            system_resolved = True
+        except OSError:
+            system_resolved = False
+        direct = self._direct_query(label, timeout) if system_resolved else None
+        for ev in self.evaluator.evaluate_hijack(system_resolved, direct,
+                                                 time.time()):
+            kwargs = {k: v for k, v in ev.items()
+                      if k not in ("kind", "severity", "confidence",
+                                   "summary", "recommendations")}
+            self.events.emit_simple(
+                ev["kind"], ev["severity"], ev["confidence"],
+                ev["summary"], source="dns",
+                recommendations=ev.get("recommendations", []), **kwargs)
+
+    def _direct_query(self, qname: str, timeout: float) -> Optional[Dict[str, Any]]:
+        """Query a public resolver DIRECTLY (bypassing the local chain).
+
+        One small UDP packet per attempt, stdlib only — the ground truth
+        that cannot be rewritten by the router's resolver. Returns None
+        when every configured resolver is unreachable (UDP/53 blocked).
+        """
+        resolvers = list(cfg("dns", "public_resolvers",
+                             ["1.1.1.1", "9.9.9.9"]) or [])
+        for server in resolvers:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(timeout)
+                try:
+                    s.sendto(build_dns_query(qname), (server, 53))
+                    data, _ = s.recvfrom(512)
+                finally:
+                    s.close()
+                parsed = parse_dns_response(data)
+                if parsed is not None:
+                    parsed["via"] = server
+                    return parsed
+            except (OSError, socket.timeout):
+                continue
+        return None
 
     def _probe(self, domain: str, timeout: float) -> Dict[str, Any]:
         t0 = time.monotonic()
@@ -236,10 +390,24 @@ class DnsGuard:
             return {"ok": False, "elapsed_s": round(time.monotonic() - t0, 3),
                     "error": str(e)}
 
+    def recommendations(self) -> List[str]:
+        """P-34: zero-trust DNS guidance. Surfaced whenever the effective
+        resolvers are LAN-only (the router's DNS) — the exact chain a
+        compromised router controls."""
+        servers = self.evaluator.baseline_servers
+        if servers and all(is_lan_resolver(s) for s in servers):
+            return list(RECOMMENDATIONS)
+        return []
+
     def status(self) -> Dict[str, Any]:
         return {
             "resolvers": self.evaluator.baseline_servers,
             "last_probe": self.last_probe,
+            "resolvers_lan_only": bool(
+                self.evaluator.baseline_servers
+                and all(is_lan_resolver(s)
+                        for s in self.evaluator.baseline_servers)),
+            "recommendations": self.recommendations(),
             "watching": self._watch_thread is not None and self._watch_thread.is_alive(),
         }
 

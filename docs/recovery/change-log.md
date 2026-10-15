@@ -380,3 +380,24 @@ evaluators; production used wall-clock so it was latent) — seeded
 with -inf now. Why: zero-trust threat model — the router itself may
 be compromised; option pushes are its steering primitive.
 Evidence: tests/test_dhcp_override.py (13 tests); suite 213 passing.
+
+2026-10-16 — **T-34** (DNS hijack detection + zero-trust guidance, P-34) —
+What: DnsGuard gained an NXDOMAIN-hijack check in the existing probe
+cycle (one extra getaddrinfo + at most one small UDP packet): a random
+label under .invalid (RFC 2606: reserved non-existent) is resolved via
+the SYSTEM resolver; when it unexpectedly answers, a direct query to a
+public resolver (hand-built DNS wire format, stdlib socket, bypassing
+the local chain entirely) provides ground truth. System answer + direct
+NXDOMAIN => dns.hijack_signature (critical, confirmed) carrying
+concrete recommendations (systemd-resolved DNSOverTLS with
+1.1.1.1#cloudflare-dns.com / 9.9.9.9#dns.quad9.net, or direct public
+resolvers, keeping dhcp.dns_override protection on). Direct check
+unreachable (UDP/53 blocked) => suspected, not confirmed. Status/
+dashboard gained resolvers_lan_only + standing recommendations when the
+whole resolver chain is the router's (the exact chain a compromised
+router controls). Config: dns.hijack_check (default on),
+dns.public_resolvers (default 1.1.1.1, 9.9.9.9). Why: the updated
+threat model treats the router itself as potentially hostile — resolver
+*set* watching cannot see fabricated answers. Evidence:
+tests/test_dns_hijack.py (13 tests, wire format hex-verified); suite
+228 passing.
