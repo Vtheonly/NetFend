@@ -295,7 +295,7 @@ def run_service():
     try:
         print()
         print("╔══════════════════════════════════════════════╗")
-        print("║   NetFend — Network Defense Engine (live)   ║")
+        print("║   NetFend — Network Defense Engine (live)    ║")
         print("╚══════════════════════════════════════════════╝")
         print(f"  Interface  : {snap['interface']}")
         print(f"  This host  : {snap['my_ip']}  ({snap['my_mac']})")
