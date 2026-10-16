@@ -114,6 +114,7 @@ class Ipv6Guard:
         self.guard_active: Optional[bool] = None   # decided at enforce time
         self._ra_hardener: Optional[KernelHardener] = None
         self._sniffer = None
+        self._keeper = None  # P-42: sniffer supervision across link flaps
         self._stop = threading.Event()
 
     # -- state file ------------------------------------------------------------
@@ -202,14 +203,19 @@ class Ipv6Guard:
             return False
         snap = self.nm.snapshot()
         try:
-            from scapy.all import AsyncSniffer
             # AF_PACKET taps see frames before netfilter input drops, so
             # detection works even while the nft RA drop is active.
-            self._sniffer = AsyncSniffer(
-                filter="icmp6", prn=self._on_packet, store=False,
-                iface=snap["interface"])
+            self._sniffer = self._make_sniffer(snap["interface"])
             self._sniffer.start()
             log_info("IPv6 RA conflict detection sniffer active")
+            # P-42: keep the sniffer alive across link flaps
+            from netfend.utils.sniffer_keeper import SnifferKeeper
+            self._keeper = SnifferKeeper(
+                self.events, self.nm, "ipv6",
+                get=lambda: self._sniffer,
+                build=self._make_sniffer,
+                set_=self._store_sniffer)
+            self._keeper.start()
             return True
         except Exception as e:
             self.events.emit_simple(
@@ -217,6 +223,22 @@ class Ipv6Guard:
                 f"IPv6 RA sniffer could not start: {e}",
                 source="ipv6")
             return False
+
+    def _make_sniffer(self, iface: str):
+        """Fresh ICMPv6 sniffer bound to the given interface (P-42)."""
+        from scapy.all import AsyncSniffer
+        return AsyncSniffer(
+            filter="icmp6", prn=self._on_packet, store=False, iface=iface)
+
+    def _store_sniffer(self, sniffer) -> None:
+        self._sniffer = sniffer
+
+    def sniffer_alive(self) -> bool:
+        """Liveness for status/doctor (True when supervised and healthy)."""
+        if self._sniffer is None:
+            return False
+        t = getattr(self._sniffer, "thread", None)
+        return t is not None and t.is_alive()
 
     def _on_packet(self, packet):
         try:
@@ -240,6 +262,8 @@ class Ipv6Guard:
     # -- lifecycle -----------------------------------------------------------------
     def stop(self) -> None:
         self._stop.set()
+        if self._keeper:
+            self._keeper.stop()   # FIRST (P-42): no restart during teardown
         if self._sniffer:
             try:
                 self._sniffer.stop()

@@ -139,6 +139,9 @@ def cmd_doctor():
         arp = build_arp_ruleset("192.0.2.10", "00:11:22:33:44:55",
                                 "192.0.2.1", "00:11:22:33:44:99")
         check("arp ruleset generation", "netfend_arp" in arp, "")
+        check("arp hardware-address token (P-37)",
+              "arp saddr ether !=" in arp and "arp saddr mac" not in arp,
+              "nft grammar is arp saddr {ip|ether}")
     except Exception as e:
         check("ruleset generation", False, str(e))
 
@@ -267,11 +270,57 @@ def cmd_blacklist_show(intel):
     print(f"{'─' * 90}\n")
 
 
+def _acquire_engine_lock(path: str = "/run/netfend.engine.lock"):
+    """P-41: exactly one defense engine per machine.
+
+    The live report showed the systemd service AND a manual `sudo netfend`
+    running at the same time: two engines fought over kernel state, the
+    dashboard port (bind failure), and gateway re-baselines (feedback
+    thrash). flock(2) is the mechanism of choice — the kernel releases it
+    when the holder exits for ANY reason (including crash), so there is
+    no stale-lock recovery to implement.
+
+    Returns (fd, conflict):
+      fd int, conflict None    — lock acquired (keep fd open for life)
+      fd None, conflict str    — another engine holds it (str = holder pid)
+      fd None, conflict None   — locking impossible (degraded; continue)
+    """
+    import fcntl
+    fd = None
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as e:
+        print(f"[NetFend] WARNING: engine lock unavailable ({e}); "
+              "continuing without single-instance protection")
+        return None, None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        holder = ""
+        try:
+            os.lseek(fd, 0, 0)
+            holder = os.read(fd, 64).decode(errors="replace").strip()
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None, (holder or "unknown")
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+    except OSError:
+        pass
+    return fd, None
+
+
 def run_service():
     """Foreground engine run (used by systemd and manual start).
 
     This is the single entry point (`sudo netfend` / `sudo net_protect`):
     engine + dashboard together, one terminal, Ctrl+C to stop cleanly.
+    Returns an exit code (0 = ran, 1 = refused, e.g. another instance).
     """
     from netfend.services.defense_engine import DefenseEngine
     from netfend.dashboard.server import DashboardServer
@@ -285,7 +334,32 @@ def run_service():
         print("  sudo netfend            run the defense engine (foreground)")
         print("  netfend --doctor        check capabilities without root")
         print("  netfend --status        show a status snapshot")
-        return
+        return 1
+
+    # P-41: single instance — the service and a manual run must never
+    # coexist (they would fight over kernel state + the dashboard port)
+    lock_fd, conflict = _acquire_engine_lock()
+    if conflict is not None:
+        print("[NetFend] Another defense engine is already running"
+              + (f" (pid {conflict})" if conflict.isdigit() else "") + ".")
+        try:
+            import subprocess
+            r = subprocess.run(["systemctl", "is-active", "netfend"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip() == "active":
+                print("       The systemd service 'netfend' is the running instance:")
+                print("         - watch it    : systemctl status netfend"
+                      "   (or: netfend --status)")
+                print("         - dashboard   : http://127.0.0.1:8787/")
+                print("         - stop it     : sudo systemctl stop netfend"
+                      "  (then sudo netfend works)")
+        except Exception:
+            pass
+        print("       Two engines must never run at once — they would fight")
+        print("       over kernel state, the dashboard port, and re-baselines.")
+        return 1
+    # lock_fd stays open for the lifetime of this process; the kernel
+    # releases it on exit (any exit — including crashes)
 
     engine = DefenseEngine()
     dashboard = DashboardServer(engine, engine.events)
@@ -316,6 +390,7 @@ def run_service():
     finally:
         engine.stop()
         print("Defense deactivated. Engine-owned kernel state removed.")
+    return 0
 
 
 def main():
@@ -393,7 +468,7 @@ def main():
                 log_info("No blacklist file found.")
         else:
             # Default: run the engine (service mode)
-            run_service()
+            sys.exit(run_service() or 0)
 
 
 if __name__ == "__main__":

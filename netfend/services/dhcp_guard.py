@@ -299,6 +299,7 @@ class DhcpGuard:
         self.evaluator = DhcpEvaluator()
         self.evaluator.learn_observations = int(cfg("dhcp", "learn_observations", 2))
         self._sniffer = None
+        self._keeper = None  # P-42: sniffer supervision across link flaps
         self._persist_path: Optional[Path] = None
         self._dirty = False
         self._load_baseline()
@@ -343,13 +344,35 @@ class DhcpGuard:
         snap = self.nm.snapshot()
         self.evaluator.gateway = {"ip": snap.get("gateway_ip"),
                                   "macs": [snap.get("gateway_mac")] if snap.get("gateway_mac") else []}
-        from scapy.all import AsyncSniffer
-        self._sniffer = AsyncSniffer(
-            filter="udp port 67", prn=self._on_packet, store=False,
-            iface=snap["interface"])
+        self._sniffer = self._make_sniffer(snap["interface"])
         self._sniffer.start()
         log_info("DHCP guard sniffer active")
+        # P-42: keep the sniffer alive across link flaps
+        from netfend.utils.sniffer_keeper import SnifferKeeper
+        self._keeper = SnifferKeeper(
+            self.events, self.nm, "dhcp",
+            get=lambda: self._sniffer,
+            build=self._make_sniffer,
+            set_=self._store_sniffer)
+        self._keeper.start()
         return True
+
+    def _make_sniffer(self, iface: str):
+        """Fresh DHCP sniffer bound to the given interface (P-42 restarts)."""
+        from scapy.all import AsyncSniffer
+        return AsyncSniffer(
+            filter="udp port 67", prn=self._on_packet, store=False,
+            iface=iface)
+
+    def _store_sniffer(self, sniffer) -> None:
+        self._sniffer = sniffer
+
+    def sniffer_alive(self) -> bool:
+        """Liveness for status/doctor (True when supervised and healthy)."""
+        if self._sniffer is None:
+            return False
+        t = getattr(self._sniffer, "thread", None)
+        return t is not None and t.is_alive()
 
     def _on_packet(self, packet):
         try:
@@ -427,6 +450,8 @@ class DhcpGuard:
         }
 
     def stop(self):
+        if self._keeper:
+            self._keeper.stop()   # FIRST (P-42): no restart during teardown
         if self._sniffer:
             try:
                 self._sniffer.stop()

@@ -303,6 +303,7 @@ class ArpGuard:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._sniffer = None
+        self._keeper = None  # P-42: sniffer supervision across link flaps
         self._registry_dirty = False
         self._registry_last_save = 0.0
 
@@ -323,17 +324,39 @@ class ArpGuard:
                 "static neighbor pinning still active",
                 source="arp")
             return False
-        from scapy.all import AsyncSniffer
-        self._sniffer = AsyncSniffer(
-            filter="arp", prn=self._on_packet, store=False,
-            iface=snap["interface"])
+        self._sniffer = self._make_sniffer(snap["interface"])
         self._sniffer.start()
         log_info("ARP guard sniffer active")
+        # P-42: keep the sniffer alive across link flaps (Errno 100 kills
+        # the socket; without supervision the guard stays blind)
+        from netfend.utils.sniffer_keeper import SnifferKeeper
+        self._keeper = SnifferKeeper(
+            self.events, self.nm, "arp",
+            get=lambda: self._sniffer,
+            build=self._make_sniffer,
+            set_=self._store_sniffer)
+        self._keeper.start()
         # Debounced registry persistence thread (audit RC-9)
         self._thread = threading.Thread(target=self._debounce_loop,
                                         name="nf-arp-debounce", daemon=True)
         self._thread.start()
         return True
+
+    def _make_sniffer(self, iface: str):
+        """Fresh ARP sniffer bound to the given interface (P-42 restarts)."""
+        from scapy.all import AsyncSniffer
+        return AsyncSniffer(
+            filter="arp", prn=self._on_packet, store=False, iface=iface)
+
+    def _store_sniffer(self, sniffer) -> None:
+        self._sniffer = sniffer
+
+    def sniffer_alive(self) -> bool:
+        """Liveness for status/doctor (True when supervised and healthy)."""
+        if self._sniffer is None:
+            return False
+        t = getattr(self._sniffer, "thread", None)
+        return t is not None and t.is_alive()
 
     def _on_packet(self, packet):
         try:
@@ -415,6 +438,8 @@ class ArpGuard:
 
     def stop(self):
         self._stop.set()
+        if self._keeper:
+            self._keeper.stop()   # FIRST (P-42): no restart during teardown
         if self._sniffer:
             try:
                 self._sniffer.stop()
