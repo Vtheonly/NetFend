@@ -32,6 +32,7 @@ to events.
 | ICMP redirects / source routing (gateway-grade route hijack) | sysctl + nft counters (ADR-007) | `accept_redirects=0` (v4+v6), `accept_source_route=0`, `rp_filter` strict, line-rate redirect drops |
 | SYN/UDP connection floods, scans, ICMP floods | nftables meters + counters | Kernel-level per-source rate limiting (drop) |
 | Repeated Wi-Fi disconnects (possible deauth attacks) | Disconnect-pattern correlation with ARP/DHCP events | Alerting with confidence level |
+| **Wi-Fi deauth flood (aireplay-ng / mdk4 / cheap jammers — targeted at your MAC, works WITHOUT network access)** | **wpa_supplicant reason-code signature** (P-43): repeated AP-addressed disconnects (`locally_generated=0`, reason 1/2/7) within 3 min | `wifi.deauth_signature` critical event with the honest fix list: **enable 802.11w/PMF (ideally Required) + WPA3-SAE on the router**, prefer 5 GHz — password changes do NOT stop this attack |
 
 All kernel changes are **engine-owned and restored on stop**: sysctl
 originals persist to `hardening_state.json` / `ipv6_state.json` before

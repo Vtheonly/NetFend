@@ -155,6 +155,11 @@ DEFAULTS: Dict[str, Any] = {
         "disconnect_count": 3,          # disconnects within window => suspicious pattern
         "disconnect_window_s": 300,
         "weak_signal_rssi": -80,        # dBm
+        # P-43: wpa_supplicant reason-code watch (deauth flood signature)
+        "supplicant_monitor": True,
+        "supplicant_poll_s": 5,         # journal read interval (bounded by --since)
+        "deauth_threshold": 4,          # AP-addressed forged-deauth disconnects in window
+        "deauth_window_s": 180,
     },
     "metrics": {
         "enabled": True,

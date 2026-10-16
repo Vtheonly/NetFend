@@ -107,6 +107,9 @@ def cmd_doctor():
           "" if caps["scapy"] else "ARP/DHCP guards disabled; install python3-scapy")
     check("wireless tools (iw)", caps["wireless"],
           "" if caps["wireless"] else "Wi-Fi diagnostics limited")
+    check("journalctl (wpa_supplicant reason codes)", caps.get("journalctl", False),
+          "" if caps.get("journalctl", False)
+          else "deauth-signature detection (wifi.deauth_signature) disabled")
     check("monitor mode support", caps["monitor_mode"],
           "frame-level deauth detection needs it; 802.11w/PMF recommended on AP")
     check("systemd", caps["systemd_running"], "")

@@ -505,3 +505,28 @@ Why: the sandbox has no nft binary (U-5) — grammar-level bugs can only
 be caught by the on-target run, so the verification steps must be
 recorded where the next agent sees them. Evidence: this commit;
 registries P-37..P-42 / T-38..T-41; suite 248/248; doctor 15 passed.
+
+2026-10-16 — **T-42** (deauth-signature detection, P-43) —
+What: the owner's second live incident report showed the pattern the
+engine was blind to — router factory-reset (new admin + Wi-Fi
+passwords, WPS disabled) did NOT stop the blocking: ~17 min of normal
+use, then a slow phase, then locked out — only his device, other
+devices unaffected. That is the wireless forged-deauth flood signature
+(spoofed AP management frames; needs zero network access, so password
+changes are irrelevant). The engine could only count state-transition
+disconnects. Changes: SupplicantMonitor reads wpa_supplicant's
+CTRL-EVENT-DISCONNECTED lines (reason= + locally_generated=) from the
+journal (bounded --since polling, microsecond watermark dedup, 5-failure
+give-up); classify_deauth_signature fires `wifi.deauth_signature`
+(critical/suspected) on >=4 AP-addressed disconnects (locally_generated=0,
+reason in {1,2,7}) within 180 s, with reason counts and the honest fix
+list (802.11w/PMF Required + WPA3-SAE + 5 GHz). Client-initiated
+deauths never count (false-positive guard); the AP's MAC is never fed
+into threat intel (it is the victim's own router); journalctl joined
+the capability probe with a doctor check; `deauth_watch` in status;
+config keys wifi.supplicant_monitor/supplicant_poll_s/deauth_threshold/
+deauth_window_s; version 2.2.0. Why: reason codes are the only
+client-side ground truth for WHY a link dropped, they need no monitor
+mode, and the owner needs to know that this attack class is fixed at
+the ROUTER (PMF/WPA3), not by passwords. Evidence: TestDeauthSignature
+(9) + TestSupplicantMonitor (7); suite 264 passing; doctor 16 checks.

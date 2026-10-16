@@ -223,6 +223,19 @@ The next agent must not have to rediscover the same problem.
   stop their SnifferKeeper BEFORE their sniffer (no resurrection during
   teardown, P-42).
 
+- wpa_supplicant `locally_generated=0` means the disconnect frame
+  ARRIVED from the AP (genuine or forged — indistinguishable without
+  PMF); `=1` means the client sent it (roaming, NM policy, beacon-loss
+  give-up). Only the former, with reason in {1,2,7} and rapid
+  repetition, is the deauth-flood signature (P-43). NEVER record the
+  BSSID from such events into threat intel: it is the (spoofed)
+  address of the victim's own AP, not the attacker. And never claim
+  'confirmed' for it — client-side cannot verify without PMF.
+- `journalctl -t wpa_supplicant` is the reason-code source on
+  systemd distros; the poller must stay bounded (--since window,
+  watermark dedup, consecutive-failure give-up) and degrade to a
+  notice when journalctl/journald is absent (ADR-005 discipline).
+
 ## 6. Repository Conventions
 
 - Branch policy: **`main` only**. All work is committed to `main`.

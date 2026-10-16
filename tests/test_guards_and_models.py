@@ -1,5 +1,8 @@
 """DHCP, DNS, Wi-Fi, metrics evaluators + threat profile + registries."""
+import threading
 import time
+
+import pytest
 
 from netfend.services.dhcp_guard import DhcpEvaluator
 from netfend.services.dns_guard import DnsEvaluator, parse_resolv_conf
@@ -294,6 +297,222 @@ class TestWifiClassifier:
         assert d["wlan0"]["state"] == "connected"
         assert d["wlan0"]["connection"] == "HomeNet"
         assert d["eth0"]["state"] == "unavailable"
+
+
+class TestDeauthSignature:
+    """P-43: forged-deauth flood fingerprint (wpa_supplicant reason codes)."""
+
+    def test_parse_supplicant_disconnect_full(self):
+        from netfend.services.wifi_diagnostics import parse_supplicant_disconnect
+        line = ("wlo1: CTRL-EVENT-DISCONNECTED bssid=1C:73:E2:57:F1:39 "
+                "reason=2 locally_generated=0 freq=2437")
+        d = parse_supplicant_disconnect(line)
+        assert d == {"bssid": "1c:73:e2:57:f1:39", "reason": 2,
+                     "locally_generated": 0}
+
+    def test_parse_supplicant_disconnect_no_locally_generated(self):
+        from netfend.services.wifi_diagnostics import parse_supplicant_disconnect
+        line = "wlo1: CTRL-EVENT-DISCONNECTED bssid=aa:bb:cc:dd:ee:ff reason=7"
+        d = parse_supplicant_disconnect(line)
+        assert d["reason"] == 7 and d["locally_generated"] is None
+
+    def test_parse_supplicant_disconnect_non_match(self):
+        from netfend.services.wifi_diagnostics import parse_supplicant_disconnect
+        assert parse_supplicant_disconnect(
+            "wlo1: CTRL-EVENT-BEACON-LOSS freq=2437") is None
+        assert parse_supplicant_disconnect(
+            "wlo1: CTRL-EVENT-CONNECTED - Connection to xx completed") is None
+        assert parse_supplicant_disconnect("garbage") is None
+
+    def test_parse_journal_line(self):
+        from netfend.services.wifi_diagnostics import parse_journal_line
+        ts, msg = parse_journal_line(
+            "1697456789.123456 host wpa_supplicant[991]: wlo1: hi")
+        assert abs(ts - 1697456789.123456) < 1e-6 and "wlo1" in msg
+        assert parse_journal_line("not a journal line") is None
+        assert parse_journal_line("") is None
+
+    def _obs(self, n, reason=2, locally_generated=0, ts_offset=0.0):
+        base = 1000.0
+        return [{"bssid": "1c:73:e2:57:f1:39", "reason": reason,
+                 "locally_generated": locally_generated,
+                 "ts": base - i * 5 + ts_offset} for i in range(n)]
+
+    def test_below_threshold_none(self):
+        from netfend.services.wifi_diagnostics import classify_deauth_signature
+        assert classify_deauth_signature(self._obs(3), now=1000.0,
+                                         threshold=4, window_s=180) is None
+
+    def test_flood_fires_critical(self):
+        from netfend.services.wifi_diagnostics import classify_deauth_signature
+        ev = classify_deauth_signature(self._obs(5), now=1000.0,
+                                       threshold=4, window_s=180)
+        assert ev and ev["kind"] == "wifi.deauth_signature"
+        assert ev["severity"] == "critical"
+        assert ev["confidence"] == "suspected"   # honest: PMF would be needed to confirm
+        assert "802.11w/PMF" in ev["summary"]
+        assert ev["evidence"]["incoming_disconnects"] == 5
+        assert ev["evidence"]["reason_counts"] == {"2": 5}
+
+    def test_client_initiated_never_counts(self):
+        from netfend.services.wifi_diagnostics import classify_deauth_signature
+        # locally_generated=1: the CLIENT sent the deauth (roaming, NM
+        # policy, beacon-loss give-up) — never part of the signature
+        assert classify_deauth_signature(self._obs(9, locally_generated=1),
+                                         now=1000.0, threshold=4,
+                                         window_s=180) is None
+
+    def test_non_forged_reasons_never_count(self):
+        from netfend.services.wifi_diagnostics import classify_deauth_signature
+        # reason 3 = sending STA is leaving (benign); 15/16 = handshake
+        # failures (auth problems, different classifier's domain)
+        assert classify_deauth_signature(self._obs(9, reason=3),
+                                         now=1000.0, threshold=4,
+                                         window_s=180) is None
+
+    def test_stale_observations_outside_window(self):
+        from netfend.services.wifi_diagnostics import classify_deauth_signature
+        assert classify_deauth_signature(self._obs(5, ts_offset=-10000.0),
+                                         now=1000.0, threshold=4,
+                                         window_s=180) is None
+
+    def test_unknown_locally_generated_excluded(self):
+        from netfend.services.wifi_diagnostics import classify_deauth_signature
+        obs = [{"bssid": "aa:bb:cc:dd:ee:ff", "reason": 2,
+                "locally_generated": None, "ts": 995.0} for _ in range(9)]
+        # old supplicants without the field cannot attribute direction —
+        # require it rather than guess (false-positive guard)
+        assert classify_deauth_signature(obs, now=1000.0, threshold=4,
+                                         window_s=180) is None
+
+
+class TestSupplicantMonitor:
+    """P-43 wiring: journal poller, watermark dedup, bounded failure."""
+
+    def _journal_output(self, ts_list, reason=2, locally_generated=0,
+                        bssid="1c:73:e2:57:f1:39"):
+        lines = []
+        for ts in ts_list:
+            lines.append(
+                f"{ts:.6f} mersel-pc wpa_supplicant[991]: wlo1: "
+                f"CTRL-EVENT-DISCONNECTED bssid={bssid} reason={reason} "
+                f"locally_generated={locally_generated}")
+        return "\n".join(lines)
+
+    def test_poll_ingests_and_fires_event(self, events, monkeypatch):
+        import netfend.services.wifi_diagnostics as wmod
+        from netfend.services.wifi_diagnostics import SupplicantMonitor
+
+        now = 2000000000.0
+        monkeypatch.setattr(wmod, "cfg", lambda s, k, d=None: {
+            "supplicant_monitor": True, "supplicant_poll_s": 5,
+            "deauth_threshold": 4, "deauth_window_s": 180}.get(k, d))
+        fake_time = [now]
+        monkeypatch.setattr(wmod.time, "time", lambda: fake_time[0])
+        out = self._journal_output([now - 30, now - 25, now - 20, now - 15])
+        monkeypatch.setattr(wmod, "_run", lambda cmd: out)
+
+        m = SupplicantMonitor(events)
+        m._watermark = now - 60          # pretend engine started a minute ago
+        assert m._poll_once() is True
+        assert len(m._observations) == 4
+        fired = [e for e in events.query(limit=20)
+                 if e["kind"] == "wifi.deauth_signature"]
+        assert fired and fired[0]["evidence"]["incoming_disconnects"] == 4
+
+    def test_watermark_dedups_overlap(self, events, monkeypatch):
+        import netfend.services.wifi_diagnostics as wmod
+        from netfend.services.wifi_diagnostics import SupplicantMonitor
+
+        now = 2000000000.0
+        monkeypatch.setattr(wmod, "cfg", lambda s, k, d=None: {
+            "deauth_threshold": 4, "deauth_window_s": 180}.get(k, d))
+        monkeypatch.setattr(wmod.time, "time", lambda: now)
+        # the --since overlap re-returns the same lines every poll
+        out = self._journal_output([now - 10, now - 5])
+        monkeypatch.setattr(wmod, "_run", lambda cmd: out)
+
+        m = SupplicantMonitor(events)
+        m._watermark = now - 60
+        assert m._poll_once() is True
+        assert m._poll_once() is True       # same lines again
+        assert len(m._observations) == 2    # no duplicates ingested
+        assert m._watermark == pytest.approx(now - 5)
+
+    def test_benign_lines_ingested_without_event(self, events, monkeypatch):
+        import netfend.services.wifi_diagnostics as wmod
+        from netfend.services.wifi_diagnostics import SupplicantMonitor
+
+        now = 2000000000.0
+        monkeypatch.setattr(wmod, "cfg", lambda s, k, d=None: {
+            "deauth_threshold": 4, "deauth_window_s": 180}.get(k, d))
+        monkeypatch.setattr(wmod.time, "time", lambda: now)
+        # client-initiated deauths (roaming) + unrelated lines
+        out = (self._journal_output([now - 30, now - 20, now - 10],
+                                    reason=3, locally_generated=1)
+               + f"\n{now - 5:.6f} host wpa_supplicant[991]: wlo1: "
+                 "CTRL-EVENT-BEACON-LOSS freq=2437")
+        monkeypatch.setattr(wmod, "_run", lambda cmd: out)
+
+        m = SupplicantMonitor(events)
+        m._watermark = now - 60
+        assert m._poll_once() is True
+        assert len(m._observations) == 3
+        assert not [e for e in events.query(limit=20)
+                    if e["kind"] == "wifi.deauth_signature"]
+
+    def test_journal_failure_bounded(self, events, monkeypatch):
+        import netfend.services.wifi_diagnostics as wmod
+        from netfend.services.wifi_diagnostics import (
+            SupplicantMonitor, _MAX_CONSECUTIVE_FAILURES)
+
+        monkeypatch.setattr(wmod, "cfg", lambda s, k, d=None: {
+            "supplicant_poll_s": 0.01}.get(k, d))
+        monkeypatch.setattr(wmod, "_run", lambda cmd: None)  # journalctl dead
+
+        m = SupplicantMonitor(events)
+        m._watermark = time.time()
+        assert m._poll_once() is False
+        # the loop gives up after the bounded failure count
+        t = threading.Thread(target=m._loop, daemon=True)
+        t.start()
+        t.join(timeout=3)
+        assert m.active is False
+        stopped = [e for e in events.query(limit=20)
+                   if e["kind"] == "wifi.supplicant_monitor_stopped"]
+        assert stopped
+
+    def test_start_without_journalctl(self, events, monkeypatch):
+        import netfend.services.wifi_diagnostics as wmod
+        from netfend.services.wifi_diagnostics import SupplicantMonitor
+
+        monkeypatch.setattr(wmod, "cfg", lambda s, k, d=None: {
+            "supplicant_monitor": True}.get(k, d))
+        monkeypatch.setattr(wmod.capabilities, "have", lambda n: False)
+        m = SupplicantMonitor(events)
+        assert m.start() is False
+        assert not [e for e in events.query(limit=20)
+                    if e["kind"] == "wifi.deauth_signature"]
+        notices = [e for e in events.query(limit=20)
+                   if e["kind"] == "wifi.supplicant_unavailable"]
+        assert notices
+
+    def test_status_counts_incoming(self, events, monkeypatch):
+        import netfend.services.wifi_diagnostics as wmod
+        from netfend.services.wifi_diagnostics import SupplicantMonitor
+
+        now = 2000000000.0
+        monkeypatch.setattr(wmod, "cfg", lambda s, k, d=None: {
+            "deauth_threshold": 4, "deauth_window_s": 180}.get(k, d))
+        monkeypatch.setattr(wmod.time, "time", lambda: now)
+        out = self._journal_output([now - 30, now - 25, now - 20, now - 15])
+        monkeypatch.setattr(wmod, "_run", lambda cmd: out)
+        m = SupplicantMonitor(events)
+        m._watermark = now - 60
+        m._poll_once()
+        st = m.status()
+        assert st["active"] is False            # start() not called
+        assert st["incoming_deauth_disconnects"] == 4
 
 
 class TestMetrics:

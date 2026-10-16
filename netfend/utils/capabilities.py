@@ -11,7 +11,7 @@ from typing import Any, Dict
 
 _PROBED: Dict[str, Any] = {}
 
-_OPTIONAL_TOOLS = ("nft", "ip", "ping", "iw", "nmcli", "systemctl", "resolvectl", "nft --version")
+_OPTIONAL_TOOLS = ("nft", "ip", "ping", "iw", "nmcli", "systemctl", "resolvectl", "journalctl", "nft --version")
 
 
 def _which(tool: str) -> bool:
@@ -49,7 +49,8 @@ def probe() -> Dict[str, Any]:
         caps["colorama"] = False
 
     # External tools
-    for tool in ("nft", "ip", "ping", "iw", "nmcli", "systemctl", "resolvectl"):
+    for tool in ("nft", "ip", "ping", "iw", "nmcli", "systemctl",
+                 "resolvectl", "journalctl"):
         caps[tool] = _which(tool)
 
     # nftables kernel support (nft binary present AND can list its own tables)
@@ -132,4 +133,7 @@ def summary() -> Dict[str, Any]:
         notes.append("monitor mode not available: frame-level deauth detection impossible; enable 802.11w/PMF on the router instead")
     if not caps["systemd_running"]:
         notes.append("systemd not detected: service management commands unavailable")
+    if not caps["journalctl"]:
+        notes.append("journalctl unavailable: wpa_supplicant reason-code watch "
+                     "(wifi.deauth_signature deauth-flood detection) disabled")
     return {"capabilities": caps, "notes": notes}
