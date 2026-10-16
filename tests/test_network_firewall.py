@@ -110,8 +110,22 @@ class TestFirewallRulesets:
         rs = build_arp_ruleset("192.168.1.50", "aa:bb:cc:dd:ee:ff",
                                "192.168.1.1", "11:22:33:44:55:66")
         assert f"table arp {ARP_TABLE}" in rs
+        # P-37: nft grammar is `arp saddr {ip|ether}` — the hardware
+        # field token is `ether`; `mac` is rejected by nft's parser.
+        assert "arp saddr ether != aa:bb:cc:dd:ee:ff" in rs
+        assert "arp saddr ether != 11:22:33:44:55:66" in rs
+        assert "arp saddr mac" not in rs
+
+    def test_arp_ruleset_legacy_token(self):
+        """P-37 fallback candidate: the legacy `mac` spelling is kept as
+        a last-ditch candidate for exotic nft builds only."""
+        rs = build_arp_ruleset("192.168.1.50", "aa:bb:cc:dd:ee:ff",
+                               "192.168.1.1", "11:22:33:44:55:66",
+                               ll_token="mac")
         assert "arp saddr mac != aa:bb:cc:dd:ee:ff" in rs
-        assert "arp saddr mac != 11:22:33:44:55:66" in rs
+        with pytest.raises(ValueError):
+            build_arp_ruleset("192.168.1.50", "aa:bb:cc:dd:ee:ff",
+                              None, None, ll_token="bogus")
 
     def test_arp_ruleset_no_gateway(self):
         rs = build_arp_ruleset("192.168.1.50", "aa:bb:cc:dd:ee:ff", None, None)
@@ -173,8 +187,17 @@ class TestFallbackRulesets:
     def test_minimal_arp_ruleset(self):
         rs = build_minimal_arp_ruleset("192.168.1.50", "aa:bb:cc:dd:ee:ff")
         assert f"table arp {ARP_TABLE}" in rs
-        assert "arp saddr mac != aa:bb:cc:dd:ee:ff" in rs
+        assert "arp saddr ether != aa:bb:cc:dd:ee:ff" in rs
+        assert "arp saddr mac" not in rs
         assert "gateway IP" not in rs        # own-IP protection only
+
+    def test_minimal_arp_ruleset_legacy_token(self):
+        rs = build_minimal_arp_ruleset("192.168.1.50", "aa:bb:cc:dd:ee:ff",
+                                       ll_token="mac")
+        assert "arp saddr mac !=" in rs
+        with pytest.raises(ValueError):
+            build_minimal_arp_ruleset("192.168.1.50", "aa:bb:cc:dd:ee:ff",
+                                      ll_token="nope")
 
     def test_strict_full_ruleset_has_no_conflicting_l4_rule(self):
         """The old strict profile contained `meta l4proto tcp ... udp dport 53`
@@ -250,7 +273,7 @@ class TestPerTableApply:
         monkeypatch.setattr(fw, "_nft_apply", fake_apply)
         assert fw.apply() is True
         assert applied_tables == ["arp"]           # arp applied, inet not
-        assert fw.arp_variant in ("full", "minimal")
+        assert fw.arp_variant in ("full", "full-legacy", "minimal", "minimal-legacy")
         assert fw.filter_variant is None
         # validation_failed event must carry the real nft error (P-18)
         val_failed = [e for e in events.query(limit=50)
@@ -276,3 +299,157 @@ class TestPerTableApply:
         fallback = [e for e in events.query(limit=50)
                     if e["kind"] == "firewall.fallback"]
         assert fallback and fallback[0]["evidence"].get("variant") == "basic"
+
+
+class TestRound2FieldFixes:
+    """Live install report 2026-10-16: P-37..P-40 regressions."""
+
+    @pytest.fixture()
+    def fw(self, events):
+        from netfend.services.firewall import FirewallManager
+
+        class FakeNm:
+            def __init__(self):
+                self.state = {"interface": "wlan0", "my_ip": "192.168.1.50",
+                              "my_mac": "aa:bb:cc:dd:ee:ff",
+                              "gateway_ip": "192.168.1.1",
+                              "gateway_mac": "11:22:33:44:55:66",
+                              "link_up": True}
+
+            def snapshot(self):
+                return dict(self.state)
+
+        fw = FirewallManager(FakeNm(), events)
+        fw.nm_fake = fw.nm
+        return fw
+
+    def test_arp_ladder_falls_back_to_legacy_token(self, fw, monkeypatch):
+        """P-37: when the local nft rejects the `ether` spelling, the
+        legacy `mac` candidate must still load instead of nothing."""
+        monkeypatch.setattr(fw, "available", lambda: True)
+        monkeypatch.setattr(fw, "_selfcheck", lambda: True)
+
+        def fake_check(ruleset):
+            if f"table arp {ARP_TABLE}" in ruleset:
+                return ("arp saddr mac" in ruleset), (
+                    None if "arp saddr mac" in ruleset
+                    else "syntax error, unexpected string, expecting ether or ip")
+            return True, None
+
+        monkeypatch.setattr(fw, "_nft_check", fake_check)
+        monkeypatch.setattr(fw, "_nft_apply", lambda rs: (True, None))
+        assert fw.apply() is True
+        assert fw.arp_variant == "full-legacy"
+
+    def test_filter_applies_when_arp_fails(self, fw, events, monkeypatch):
+        """P-38: ARP rejection must NOT cancel the filter table — the
+        live report showed one bad ARP token turning off the WHOLE
+        kernel layer plus a 300 s cooldown lockout."""
+        monkeypatch.setattr(fw, "available", lambda: True)
+        monkeypatch.setattr(fw, "_selfcheck", lambda: True)
+
+        def fake_check(ruleset):
+            if f"table arp {ARP_TABLE}" in ruleset:
+                return False, "arp table always rejected in this test"
+            return True, None
+
+        applied_tables = []
+
+        def fake_apply(ruleset):
+            applied_tables.append(
+                "arp" if f"table arp {ARP_TABLE}" in ruleset else "inet")
+            return True, None
+
+        monkeypatch.setattr(fw, "_nft_check", fake_check)
+        monkeypatch.setattr(fw, "_nft_apply", fake_apply)
+        assert fw.apply() is True                    # partial protection
+        assert applied_tables == ["inet"]            # filter WAS attempted
+        assert fw.filter_variant is not None
+        assert fw.arp_variant is None
+        val_failed = [e for e in events.query(limit=50)
+                      if e["kind"] == "firewall.validation_failed"]
+        assert val_failed and val_failed[0]["evidence"].get("table") == "arp"
+
+    def test_cooldown_gates_same_identity_not_changes(self, fw, monkeypatch):
+        """P-39: after a total failure, an identical retry waits out the
+        cooldown — but a network identity change (router replacement,
+        DHCP renew) must re-apply immediately or stale rules defend a
+        ghost gateway."""
+        monkeypatch.setattr(fw, "available", lambda: True)
+        monkeypatch.setattr(fw, "_selfcheck", lambda: True)
+        checks = []
+
+        def fake_check(ruleset):
+            checks.append(ruleset)
+            return False, "rejected"
+
+        monkeypatch.setattr(fw, "_nft_check", fake_check)
+        monkeypatch.setattr(fw, "_nft_apply", lambda rs: (True, None))
+        assert fw.apply() is False                   # total failure
+        n_after_failure = len(checks)
+        assert fw.apply() is False                   # same identity: skipped
+        assert len(checks) == n_after_failure        # no new nft spawns
+        # gateway MAC changed (legitimate router replacement)
+        fw.nm_fake.state["gateway_mac"] = "99:88:77:66:55:44"
+        assert fw.apply() is False                   # still fails, BUT...
+        assert len(checks) > n_after_failure         # ...it was retried
+        # and the fingerprint now tracks the NEW identity
+        assert fw._fail_fingerprint[3] == "99:88:77:66:55:44"
+
+    def test_reapply_rebuilds_tables_and_override_drops(self, fw, monkeypatch):
+        """P-40: `nft -f` appends — re-apply must delete engine-owned
+        tables first and re-add dynamic DHCP override drops."""
+        import netfend.services.firewall as fw_mod
+
+        monkeypatch.setattr(fw, "available", lambda: True)
+        monkeypatch.setattr(fw, "_selfcheck", lambda: True)
+        calls = []
+
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            return R()
+
+        monkeypatch.setattr(fw_mod.subprocess, "run", fake_run)
+        # sandbox has no nft binary: pretend the capability probe passed
+        monkeypatch.setattr(fw_mod.capabilities, "have", lambda name: True)
+        assert fw.apply() is True
+        assert fw.add_override_drop("203.0.113.9") is True
+        n_first = len(calls)
+        # re-apply (gateway re-baseline path)
+        assert fw.apply() is True
+        new_calls = calls[n_first:]
+        # the FIRST thing the re-apply does is drop the owned tables
+        assert new_calls[0][:4] == ["nft", "delete", "table", "inet"]
+        assert new_calls[1][:4] == ["nft", "delete", "table", "arp"]
+        # and the DHCP override drop comes back with the rebuild
+        readded = [c for c in new_calls if "203.0.113.9" in c]
+        assert len(readded) >= 2                     # input + output rules
+        assert fw.override_drops == ["203.0.113.9"]
+
+    def test_remove_is_unconditional(self, fw, monkeypatch):
+        """P-40: remove() must clean tables even when this instance never
+        applied anything (crash leftovers from a previous run)."""
+        import netfend.services.firewall as fw_mod
+
+        calls = []
+
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            return R()
+
+        monkeypatch.setattr(fw_mod.subprocess, "run", fake_run)
+        fw.applied = False
+        fw.last_failure = None
+        fw.remove()
+        assert any(c[:4] == ["nft", "delete", "table", "arp"] for c in calls)
+        assert any(c[:4] == ["nft", "delete", "table", "inet"] for c in calls)

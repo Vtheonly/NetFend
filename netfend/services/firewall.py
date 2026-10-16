@@ -26,6 +26,25 @@ Application flow now:
   5. on failure -> delete engine-owned tables (rollback), CRITICAL event
      including the nft stderr excerpt, backoff
 
+Field-tested round 2 (2026-10-16, live install report):
+The second deployment showed `nft -c rejected ruleset` on every ARP
+table attempt — the token was `arp saddr mac`, but nft's grammar for
+the ARP payload is `arp saddr {ip|ether}` (hardware field = `ether`).
+Three compounding design flaws turned one bad token into a total
+kernel-layer outage (P-37..P-40):
+
+  5. Both ARP candidates shared the bad token, so the whole ladder was
+     rejected — and the early `return False` then skipped the filter
+     table too (P-38: table independence only worked one way).
+  6. The failure cooldown (300 s) then blocked every re-apply triggered
+     by the gateway re-baselines — while the log claimed kernel drops
+     were active (P-39: cooldown must gate identical retries, never
+     identity changes).
+  7. `nft -f` APPENDS rules to existing chains — re-applying over live
+     tables (re-baseline, DHCP renew, crash leftovers) would stack
+     duplicate rules and keep defending a stale gateway MAC (P-40:
+     engine-owned tables are dropped first, then rebuilt).
+
 Standard profile keeps chain policy `accept` and only drops hostile
 patterns (invalid, floods, scans) so legitimate traffic is never throttled
 (owner requirement #1). The strict profile (opt-in) is default-drop.
@@ -46,6 +65,14 @@ _TIMEOUT = 8
 
 # How much nft stderr to surface in events/logs (keep events readable)
 _ERR_EXCERPT = 200
+
+# P-37: nft grammar for the ARP payload hardware (MAC) address field is
+# `arp saddr ether` / `arp daddr ether` — `arp saddr {ip|ether}`. The
+# `mac` spelling is rejected by nft's parser ("syntax error, unexpected
+# string, expecting ether or ip" — live report 2026-10-16). It is kept
+# ONLY as a last-ditch fallback candidate in case an exotic nft build
+# parses it; every stock nft release tested wants `ether`.
+ARP_LL_TOKENS = ("ether", "mac")
 
 
 # ---------------------------------------------------------------------------
@@ -199,13 +226,19 @@ def build_minimal_filter_ruleset(profile: str) -> str:
 
 
 def build_arp_ruleset(my_ip: str, my_mac: str, gw_ip: Optional[str],
-                      gw_mac: Optional[str]) -> str:
+                      gw_mac: Optional[str], ll_token: str = "ether") -> str:
     """Generate the full `arp netfend_arp` ruleset text (candidate #1).
 
     Fixes audit RC-8: the own-IP rule matches ONLY frames from a foreign
     MAC (sender MAC != our MAC). DAD probes (spa 0.0.0.0) never match
     `arp saddr ip <my_ip>` and are therefore unaffected.
+
+    P-37: `ll_token` selects the ARP hardware-address field spelling.
+    Default "ether" is the nft grammar (`arp saddr {ip|ether}`);
+    "mac" is the legacy spelling kept as a fallback candidate only.
     """
+    if ll_token not in ARP_LL_TOKENS:
+        raise ValueError(f"unknown arp link-layer token: {ll_token!r}")
     if not (valid_ipv4(my_ip) and valid_mac(my_mac)):
         raise ValueError("valid my_ip and my_mac required for arp rules")
     if gw_ip is not None and not valid_ipv4(gw_ip):
@@ -216,11 +249,11 @@ def build_arp_ruleset(my_ip: str, my_mac: str, gw_ip: Optional[str],
         f"table arp {ARP_TABLE} {{",
         "  chain input {",
         "    type filter hook input priority 0; policy accept;",
-        f"    arp saddr ip {my_ip} arp saddr mac != {my_mac.lower()} counter drop comment \"netfend: foreign MAC claims our IP\"",
+        f"    arp saddr ip {my_ip} arp saddr {ll_token} != {my_mac.lower()} counter drop comment \"netfend: foreign MAC claims our IP\"",
     ]
     if gw_ip and gw_mac:
         lines.append(
-            f"    arp saddr ip {gw_ip} arp saddr mac != {gw_mac.lower()} counter drop comment \"netfend: foreign MAC claims gateway IP\"")
+            f"    arp saddr ip {gw_ip} arp saddr {ll_token} != {gw_mac.lower()} counter drop comment \"netfend: foreign MAC claims gateway IP\"")
     lines += [
         "  }",
         "}",
@@ -229,17 +262,23 @@ def build_arp_ruleset(my_ip: str, my_mac: str, gw_ip: Optional[str],
     return "\n".join(lines)
 
 
-def build_minimal_arp_ruleset(my_ip: str, my_mac: str) -> str:
+def build_minimal_arp_ruleset(my_ip: str, my_mac: str,
+                              ll_token: str = "ether") -> str:
     """ARP candidate #2: own-IP protection only (gateway unknown or the
     gateway-pin rule is rejected). Own-IP hijack is the NetCut 'cut the
-    victim off' primitive, so this rule is the one that must survive."""
+    victim off' primitive, so this rule is the one that must survive.
+
+    P-37: `ll_token` as in `build_arp_ruleset` ("ether" default, "mac"
+    legacy fallback candidate)."""
+    if ll_token not in ARP_LL_TOKENS:
+        raise ValueError(f"unknown arp link-layer token: {ll_token!r}")
     if not (valid_ipv4(my_ip) and valid_mac(my_mac)):
         raise ValueError("valid my_ip and my_mac required for arp rules")
     return "\n".join([
         f"table arp {ARP_TABLE} {{",
         "  chain input {",
         "    type filter hook input priority 0; policy accept;",
-        f"    arp saddr ip {my_ip} arp saddr mac != {my_mac.lower()} counter drop comment \"netfend: foreign MAC claims our IP\"",
+        f"    arp saddr ip {my_ip} arp saddr {ll_token} != {my_mac.lower()} counter drop comment \"netfend: foreign MAC claims our IP\"",
         "  }",
         "}",
         "",
@@ -302,7 +341,11 @@ class FirewallManager:
         self.profile: str = "standard"
         # which ruleset variant is active per table (P-18 observability)
         self.filter_variant: Optional[str] = None   # full|basic|minimal
-        self.arp_variant: Optional[str] = None      # full|minimal
+        self.arp_variant: Optional[str] = None      # full|full-legacy|minimal|minimal-legacy
+        # P-39: identity of the ruleset that last failed — the cooldown
+        # gates only retries of the SAME identity
+        self._fail_fingerprint: Optional[Tuple[str, ...]] = None
+        self._last_ra_guard: bool = False
         # IPs dropped as DHCP-override targets (P-33)
         self.override_drops: List[str] = []
 
@@ -331,9 +374,21 @@ class FirewallManager:
     def apply(self, interface: str = None, ra_guard: bool = False) -> bool:
         """Validate + apply rulesets. Returns True when rules are active.
 
-        Tables are applied INDEPENDENTLY (P-18): a rejected filter ruleset
-        never blocks the ARP table, and each table falls back to a simpler
-        candidate when the richer one is rejected by the local nft.
+        Tables are applied INDEPENDENTLY (P-18) — in BOTH directions
+        (P-38): a rejected filter ruleset never blocks the ARP table,
+        and a rejected ARP table no longer cancels the filter table
+        either; each table falls back to simpler candidates when the
+        richer ones are rejected by the local nft.
+
+        Idempotency (P-40): `nft -f` APPENDS rules to existing chains,
+        so re-applying over live tables would stack duplicate rules and
+        keep defending a stale gateway MAC. Engine-owned tables are
+        dropped first and rebuilt, then dynamic override drops re-added.
+
+        Failure cooldown (P-39): retries with an UNCHANGED network
+        identity wait out `rollback_cooldown_s`; an identity change
+        (new IP / gateway MAC — e.g. a legitimate router replacement)
+        always re-applies immediately so we never defend a ghost.
 
         `ra_guard` (from Ipv6Guard, T-32) adds the ICMPv6 RA drop to the
         filter ruleset — active only when the engine determined the
@@ -346,12 +401,6 @@ class FirewallManager:
                 "firewall.unavailable", "notice", "unverified",
                 f"Firewall enforcement unavailable: {reason}",
                 source="firewall")
-            return False
-
-        # Backoff after a recent failed apply (avoid tight failure loops)
-        cooldown = cfg("firewall", "rollback_cooldown_s", 300)
-        if self.last_failure and (time.time() - self.last_failure) < cooldown:
-            log_warn("Firewall apply skipped: in rollback cooldown")
             return False
 
         snap = self.nm.snapshot()
@@ -367,25 +416,52 @@ class FirewallManager:
             log_info("Firewall profile is 'off' — no rules will be applied")
             return False
 
+        # Backoff after a recent failed apply (avoid tight failure loops) —
+        # but ONLY for retries of the same identity (P-39): a network
+        # change must always rebuild, or stale pins defend a ghost.
+        cooldown = cfg("firewall", "rollback_cooldown_s", 300)
+        if (self.last_failure is not None
+                and (time.time() - self.last_failure) < cooldown
+                and self._fail_fingerprint == self._fingerprint(snap, ra_guard)):
+            log_warn("Firewall apply skipped: in rollback cooldown "
+                     "(network identity unchanged since the failure)")
+            return False
+
+        self._last_ra_guard = bool(ra_guard)
+
+        # P-40: rebuild from a clean slate — append semantics would
+        # otherwise stack duplicate rules across re-baselines (and keep
+        # stale pins from a crashed previous run alive).
+        self._delete_owned_tables()
+        self.applied = False
+        self.filter_variant = None
+        self.arp_variant = None
+
         # ------------------------------------------------------------------
         # 1) ARP table FIRST — the critical protection against gateway
-        #    spoofing. Independent of the filter table (P-18).
+        #    spoofing. Independent of the filter table (P-18). The
+        #    hardware-address token ladder covers nft grammar drift (P-37).
         # ------------------------------------------------------------------
-        arp_candidates = []
+        arp_candidates: List[Tuple[str, str]] = []
         if gw_ip and gw_mac:
-            arp_candidates.append(("full", build_arp_ruleset(my_ip, my_mac, gw_ip, gw_mac)))
-        arp_candidates.append(("minimal", build_minimal_arp_ruleset(my_ip, my_mac)))
+            arp_candidates.append(("full", build_arp_ruleset(
+                my_ip, my_mac, gw_ip, gw_mac, "ether")))
+            arp_candidates.append(("full-legacy", build_arp_ruleset(
+                my_ip, my_mac, gw_ip, gw_mac, "mac")))
+        arp_candidates.append(("minimal", build_minimal_arp_ruleset(
+            my_ip, my_mac, "ether")))
+        arp_candidates.append(("minimal-legacy", build_minimal_arp_ruleset(
+            my_ip, my_mac, "mac")))
         arp_ok, arp_err = self._apply_first_valid(arp_candidates, "arp")
         if not arp_ok:
-            # both arp candidates rejected — nothing else makes sense
-            self.last_failure = time.time()
+            # P-38: no early return — the filter table still provides
+            # invalid/flood/redirect/RA drops and must be attempted.
             self.last_error = f"arp table rejected by nft: {arp_err}"
             self.events.emit_simple(
                 "firewall.validation_failed", "critical", "confirmed",
-                f"ARP firewall ruleset rejected by nft (no ARP protection active): {arp_err}",
+                f"ARP firewall ruleset rejected by nft (no ARP anti-spoofing active): {arp_err}",
                 source="firewall", table="arp", nft_error=arp_err)
-            return False
-        if arp_err:
+        elif arp_err:
             # fell back to a weaker variant — surface it
             self.events.emit_simple(
                 "firewall.fallback", "warning", "confirmed",
@@ -394,8 +470,9 @@ class FirewallManager:
                 nft_error=arp_err)
 
         # ------------------------------------------------------------------
-        # 2) Filter table — independent; failure here degrades flood
-        #    protection but never removes the ARP protection above.
+        # 2) Filter table — independent BOTH ways (P-38): failure here
+        #    degrades flood protection but never removes the ARP table,
+        #    and ARP failure never cancels it either.
         # ------------------------------------------------------------------
         filter_candidates = [
             ("full", build_filter_ruleset(
@@ -416,12 +493,12 @@ class FirewallManager:
         ]
         filter_ok, filter_err = self._apply_first_valid(filter_candidates, "filter")
         if not filter_ok:
-            self.last_failure = time.time()
             self.last_error = f"filter table rejected by nft: {filter_err}"
             self.events.emit_simple(
                 "firewall.validation_failed", "critical", "confirmed",
                 (f"Filter ruleset rejected by nft (flood protection inactive; "
-                 f"ARP protection IS active): {filter_err}"),
+                 f"{'ARP protection IS active' if arp_ok else 'ARP protection ALSO inactive'}): "
+                 f"{filter_err}"),
                 source="firewall", table="inet", nft_error=filter_err)
             # ARP protection stays — do not roll it back (P-18)
         elif filter_err:
@@ -432,6 +509,8 @@ class FirewallManager:
                 nft_error=filter_err)
 
         if not (arp_ok or filter_ok):
+            self.last_failure = time.time()
+            self._fail_fingerprint = self._fingerprint(snap, ra_guard)
             return False
 
         # ------------------------------------------------------------------
@@ -443,7 +522,17 @@ class FirewallManager:
 
         self.applied = True
         self.applied_at = time.time()
-        self.last_failure = None
+        if arp_ok and filter_ok:
+            self.last_failure = None
+            self._fail_fingerprint = None
+        else:
+            # partial protection: keep a cooldown for the failed table so
+            # identical retries back off, while identity changes re-apply
+            self.last_failure = time.time()
+            self._fail_fingerprint = self._fingerprint(snap, ra_guard)
+        if not arp_ok:
+            log_warn("Firewall active WITHOUT ARP anti-spoofing "
+                     "(arp table rejected by nft) — see firewall.validation_failed")
         log_info(f"Firewall active (profile={self.profile}, "
                  f"filter={self.filter_variant}, arp={self.arp_variant})")
         self.events.emit_simple(
@@ -453,7 +542,33 @@ class FirewallManager:
             source="firewall", profile=self.profile,
             filter_variant=self.filter_variant, arp_variant=self.arp_variant,
             interface=interface or snap["interface"])
+
+        # P-40: re-add dynamic DHCP override drops lost with the rebuild
+        if self.override_drops:
+            dropped = list(self.override_drops)
+            self.override_drops.clear()
+            for ip in dropped:
+                self.add_override_drop(ip)
         return True
+
+    def _fingerprint(self, snap: Dict[str, Any], ra_guard: bool) -> Tuple[str, ...]:
+        """Identity of the ruleset we would build (P-39 cooldown key)."""
+        return (snap.get("my_ip"), snap.get("my_mac"),
+                snap.get("gateway_ip"), snap.get("gateway_mac"),
+                self.profile, bool(ra_guard))
+
+    def _delete_owned_tables(self) -> None:
+        """Remove engine-owned tables (idempotent; P-40 re-apply hygiene).
+
+        Also cleans tables a crashed previous run may have left behind —
+        `nft delete` on a missing table just errors, which we ignore.
+        """
+        for family, table in (("inet", FILTER_TABLE), ("arp", ARP_TABLE)):
+            try:
+                subprocess.run(["nft", "delete", "table", family, table],
+                               capture_output=True, timeout=_TIMEOUT)
+            except (OSError, subprocess.SubprocessError):
+                pass
 
     def _apply_first_valid(self, candidates: List[Tuple[str, str]],
                            table: str) -> Tuple[bool, Optional[str]]:
@@ -551,6 +666,8 @@ class FirewallManager:
         self.applied = False
         self.last_failure = time.time()
         self.last_error = reason
+        self._fail_fingerprint = self._fingerprint(
+            self.nm.snapshot(), self._last_ra_guard)
         for family, table in (("inet", FILTER_TABLE), ("arp", ARP_TABLE)):
             try:
                 subprocess.run(["nft", "delete", "table", family, table],
@@ -563,17 +680,18 @@ class FirewallManager:
             f"Firewall rules rolled back: {reason}", source="firewall")
 
     def remove(self) -> None:
-        """Clean removal on engine stop (idempotent, safe when absent)."""
-        if self.applied or self.last_failure is not None:
-            for family, table in (("inet", FILTER_TABLE), ("arp", ARP_TABLE)):
-                try:
-                    subprocess.run(["nft", "delete", "table", family, table],
-                                   capture_output=True, timeout=_TIMEOUT)
-                except (OSError, subprocess.SubprocessError):
-                    pass
-            self.applied = False
-            self.override_drops.clear()
-            log_info("Firewall tables removed (clean shutdown)")
+        """Clean removal on engine stop (idempotent, safe when absent).
+
+        Unconditional (P-40): tables a crashed previous run left behind
+        are cleaned too — deleting a missing table is a harmless no-op
+        here, and leftovers would otherwise stack with the next apply.
+        """
+        self._delete_owned_tables()
+        self.applied = False
+        self.filter_variant = None
+        self.arp_variant = None
+        self.override_drops.clear()
+        log_info("Firewall tables removed (clean shutdown)")
 
     # -- dynamic override drops (P-33) ------------------------------------------
     def add_override_drop(self, ip: str) -> bool:
