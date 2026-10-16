@@ -203,6 +203,26 @@ The next agent must not have to rediscover the same problem.
   DEFAULTS itself and overrides survive config reloads (P-31, found
   live via test pollution).
 
+- `nft` grammar for the ARP payload hardware (MAC) address field is
+  `arp saddr ether` / `arp daddr ether` — `arp saddr {ip|ether}`. The
+  spelling `arp saddr mac` is REJECTED by nft's parser ("unexpected
+  string, expecting ether or ip") and shipped unnoticed once (P-37,
+  live 2026-10-16) because the sandbox has NO nft binary. Any new nft
+  rule syntax must be checked against the nft(8) man page grammar
+  before shipping, and the fallback ladder must cover spelling drift
+  (`ARP_LL_TOKENS`).
+- `nft -f` APPENDS rules to existing chains — re-declaring a table does
+  NOT replace its contents. Every firewall re-apply must delete the
+  engine-owned tables first, then rebuild, then re-add dynamic rules
+  (override drops) that lived in them (P-40). `remove()` must be
+  unconditional so crash leftovers cannot stack with the next apply.
+- Exactly ONE engine instance per machine, enforced by flock on
+  `/run/netfend.engine.lock` (P-41). Two instances fight over kernel
+  state, the dashboard port, and gateway re-baselines. New entry points
+  must acquire the lock before constructing the engine, and guards must
+  stop their SnifferKeeper BEFORE their sniffer (no resurrection during
+  teardown, P-42).
+
 ## 6. Repository Conventions
 
 - Branch policy: **`main` only**. All work is committed to `main`.

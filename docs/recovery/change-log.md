@@ -457,3 +457,51 @@ inspection, rp_filter/VPN note, v6-vs-v4 LAN decision). Verification:
 scripts, every module imports without scapy, old/ absent.
 Why: the round's changes must survive the next agent without being
 rediscovered. Evidence: this commit + the test suite output above.
+
+2026-10-16 — **T-38** (firewall correctness round 2, P-37..P-40) —
+What: the live install report showed `nft -c rejected ruleset` on every
+ARP table attempt. Root cause: the ruleset spelled the ARP hardware
+address field `arp saddr mac`, but nft's grammar is `arp saddr
+{ip|ether}` (the parser error "unexpected string, expecting ether or
+ip" points at the exact token position — verified against both error
+column variants in the owner's log). Compounding design flaws: the
+early return after ARP failure also cancelled the filter table (P-38),
+the 300 s cooldown then blocked every re-apply the re-baselines
+triggered (P-39), and re-apply would have stacked duplicate rules
+because `nft -f` appends (P-40, latent until the syntax was fixed).
+Changes: `arp saddr ether` as the primary spelling with a `mac`
+fallback candidate in the ladder (full → full-legacy → minimal →
+minimal-legacy); table independence in BOTH directions; cooldown keyed
+on the failure fingerprint (identity change always re-applies);
+apply() deletes engine-owned tables first and re-adds DHCP override
+drops after rebuild; remove() unconditional (crash leftovers); doctor
+gained the P-37 token check. Why: one invalid token took the whole
+kernel layer down while the banner claimed protection — the failure
+mode the P-18 round was supposed to have eliminated. Evidence: 5 new
+tests in TestRound2FieldFixes; suite 248 passing; owner log columns
+4:44-46 / 4:43-45 match the `mac` token position for both host IPs.
+
+2026-10-16 — **T-39+T-40** (engine lifecycle hardening, P-41+P-42) —
+What: (1) the systemd service and a manual `sudo netfend` ran
+simultaneously — dashboard bind failure, duplicate sniffers, competing
+re-baselines; (2) a brief link flap closed all guard sockets (Scapy
+"[Errno 100] Network is down") and the guards stayed blind until
+restart. Changes: flock-based singleton (`/run/netfend.engine.lock`,
+holder pid + systemd guidance on conflict, kernel-released on any
+exit); `netfend/utils/sniffer_keeper.py` supervises each guard sniffer
+(10 s liveness checks, rebuild bound to the CURRENT interface, bounded
+to 6 consecutive restarts then one critical `*.sniffer_gave_up` event);
+`sniffer_alive()` in engine status; stop-ordering contract documented
+(keeper stops before sniffer). Why: two engines fighting produce the
+exact re-baseline thrash seen in the log, and a blind guard during
+reconnect is the attacker's favorite window. Evidence:
+TestEngineSingletonLock (4) + TestSnifferKeeper (7); suite 248 passing.
+
+2026-10-16 — **T-41** (round-2 field closure) —
+What: unknowns U-13/U-14 (on-target verification of the `ether` token
+and the keeper under a real flap), AGENTS.md §5 traps for the nft ARP
+grammar, nft append semantics, and the single-instance contract.
+Why: the sandbox has no nft binary (U-5) — grammar-level bugs can only
+be caught by the on-target run, so the verification steps must be
+recorded where the next agent sees them. Evidence: this commit;
+registries P-37..P-42 / T-38..T-41; suite 248/248; doctor 15 passed.
