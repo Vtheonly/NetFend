@@ -70,6 +70,17 @@
     "supplicant_monitor": true,
     "supplicant_poll_s": 5,
     "deauth_threshold": 4,
-    "deauth_window_s": 180
+    "deauth_window_s": 180,
+    "watcher_poll_s": 10,
+    "watcher_journal_poll_s": 5,
+    "watcher_heartbeat_s": 60,
+    "evidence_max_bytes": 5000000,
+    "abtest_profile": null,
+    "abtest_ssid": null,
+    "abtest_cycles": 2,
+    "abtest_dwell_s": 300,
+    "abtest_connect_timeout_s": 90,
+    "abtest_probe_s": 5,
+    "abtest_anonymize_hostname": true
   }
 }

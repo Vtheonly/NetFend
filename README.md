@@ -33,6 +33,7 @@ to events.
 | SYN/UDP connection floods, scans, ICMP floods | nftables meters + counters | Kernel-level per-source rate limiting (drop) |
 | Repeated Wi-Fi disconnects (possible deauth attacks) | Disconnect-pattern correlation with ARP/DHCP events | Alerting with confidence level |
 | **Wi-Fi deauth flood (aireplay-ng / mdk4 / cheap jammers — targeted at your MAC, works WITHOUT network access)** | **wpa_supplicant reason-code signature** (P-43): repeated AP-addressed disconnects (`locally_generated=0`, reason 1/2/7) within 3 min | `wifi.deauth_signature` critical event with the honest fix list: **enable 802.11w/PMF (ideally Required) + WPA3-SAE on the router**, prefer 5 GHz — password changes do NOT stop this attack |
+| **Identity-targeted blocking** ("only my device is blocked, other devices fine" — MAC blacklist on a compromised router, saved-target NetCut-class tool) | **Boot-early link-evidence recorder** (P-44): every association attempt, rejection and deauth from before NetworkManager starts, each record annotated with the MAC in use + **identity A/B experiment** verdict | `identity_targeted` verdict names the attack; personal mitigation = keep a randomized MAC on the profile (standard OS privacy feature); evidence log = reportable artifact |
 
 All kernel changes are **engine-owned and restored on stop**: sysctl
 originals persist to `hardening_state.json` / `ipv6_state.json` before
@@ -152,6 +153,60 @@ sudo netfend --authorize AA:BB:..  # mark device authorized (label only)
 sudo netfend --blacklist           # behavioral threat profiles
 sudo netfend --blacklist-clear
 ```
+
+## Wi-Fi link evidence + identity A/B experiment (P-44)
+
+Two tools for the "blocked while connecting, only my device" class of
+attacks (old WPA2 router without PMF, where password changes cannot help):
+
+**Boot-early evidence recorder** — `netfend-wifi-watch.service` starts
+`Before=NetworkManager`, so the very FIRST association attempt of every
+boot is recorded (the engine itself starts after the network is online
+and would miss exactly that window). It is a read-only observer
+(`iw event`, journal reason codes, state polls) writing
+`/var/lib/netfend/link-evidence.jsonl`, with every record annotated by
+the MAC address in use. It never touches kernel state, so it cannot
+conflict with the engine.
+
+```bash
+systemctl status netfend-wifi-watch       # installed + enabled by install.sh
+sudo netfend wifi events 30               # last 30 evidence records
+sudo netfend wifi events --kind deauth --since-s 600
+sudo netfend wifi events --kind deauth_burst   # flood signatures
+sudo netfend wifi events --kind gateway_flap   # ARP-spoof signature
+```
+
+**Identity A/B experiment** — answers "is the attacker keyed on THIS
+device's usual identity (MAC/hostname), or does he block any unknown
+device?". It connects with your real identity, then with a randomized
+locally-administered MAC (+ hostname not sent in DHCP), compares the
+outcomes under identical conditions, and writes a report with a verdict
+and next steps. Safety contract: the original identity is backed up to
+disk BEFORE anything changes, restored automatically in ALL cases
+(including Ctrl-C), and the backup is only deleted after a verified
+restore. The router, the password, and other devices are never touched.
+
+```bash
+sudo netfend wifi identity show          # current identity + pending backups
+sudo netfend wifi abtest                 # run the experiment (interactive)
+sudo netfend wifi abtest --cycles 2 --dwell 300   # ~25 min total
+sudo netfend wifi abtest --band a        # 5 GHz for BOTH phases (controlled)
+sudo netfend wifi report                 # print the latest report
+sudo netfend wifi identity random        # manual one-off (backs up first)
+sudo netfend wifi identity restore       # always available; auto-heals
+```
+
+Verdict interpretation:
+
+| real identity | random identity | verdict | meaning |
+|---|---|---|---|
+| blocked | works | `identity_targeted` | attacker maintains a static target list keyed on your MAC/hostname — keep a randomized MAC as personal mitigation, save the evidence, consider a WPA3/PMF router |
+| blocked | blocked | `not_identity_only` | tooling re-learns unknown devices (whitelist-style) or non-identity blocking — check router MAC-filter/parental entries, try `--band a` |
+| works | works | `no_active_blocking` | no blocking during this run — repeat DURING an incident |
+| works | blocked | `unknown_mac_rejected` | likely the ROUTER restricts unknown MACs (access control) — check before concluding |
+
+A run is only meaningful during a blocking episode; otherwise it
+returns `no_active_blocking` by design.
 
 ## Dashboard
 

@@ -44,6 +44,7 @@ EVENTS_FILE = DATA_DIR / "events.jsonl"
 LOG_FILE = DATA_DIR / "netfend.log"
 DASHBOARD_TOKEN_FILE = DATA_DIR / "dashboard.token"
 STATE_FILE = DATA_DIR / "engine_state.json"
+LINK_EVIDENCE_FILE = DATA_DIR / "link-evidence.jsonl"
 
 # --------------------------------------------------------------------------
 # Threat levels (kept compatible with the original model)
@@ -160,6 +161,19 @@ DEFAULTS: Dict[str, Any] = {
         "supplicant_poll_s": 5,         # journal read interval (bounded by --since)
         "deauth_threshold": 4,          # AP-addressed forged-deauth disconnects in window
         "deauth_window_s": 180,
+        # P-44: boot-early link-evidence watcher (netfend-wifi-watch.service)
+        "watcher_poll_s": 10,           # state snapshot interval (change + heartbeat)
+        "watcher_journal_poll_s": 5,    # bounded journal read interval
+        "watcher_heartbeat_s": 60,      # unconditional state record at least this often
+        "evidence_max_bytes": 5_000_000,  # link-evidence.jsonl rotation threshold
+        # P-44: identity A/B experiment defaults (netfend wifi abtest)
+        "abtest_profile": None,         # pin the NM connection profile by name
+        "abtest_ssid": None,            # ...or by SSID substring of the profile name
+        "abtest_cycles": 2,             # real+random pairs
+        "abtest_dwell_s": 300,          # observation window per phase
+        "abtest_connect_timeout_s": 90, # give up waiting for assoc+IP
+        "abtest_probe_s": 5,            # poll cadence inside a phase
+        "abtest_anonymize_hostname": True,  # dhcp-send-hostname=no in random phases
     },
     "metrics": {
         "enabled": True,

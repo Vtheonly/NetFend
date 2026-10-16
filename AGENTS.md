@@ -235,6 +235,36 @@ The next agent must not have to rediscover the same problem.
   systemd distros; the poller must stay bounded (--since window,
   watermark dedup, consecutive-failure give-up) and degrade to a
   notice when journalctl/journald is absent (ADR-005 discipline).
+- nmcli prints an EMPTY value for unset connection properties, and
+  `nmcli connection modify X prop ""` is invalid input — never write
+  an empty string back when restoring. The IdentityController
+  normalizes empties to the documented NM defaults (`preserve` for
+  wifi.cloned-mac-address, `any` for wifi.band, `yes` for
+  dhcp-send-hostname) at BACKUP time, so restore always applies
+  concrete values (P-44).
+- Identity experiments MUST keep the backup-restore contract: backup
+  to disk BEFORE the first modify (atomic write), restore in `finally`
+  (Ctrl-C and nmcli failures included), delete the backup only after
+  a VERIFIED restore, and auto-heal a leftover backup at the start of
+  the next run instead of overwriting it. A crashed experiment must
+  never strand the original identity (P-44).
+- Cross-process JSONL evidence log: exactly ONE process (the link
+  watcher) owns rotation; external writers (A/B phase markers) open
+  per write; queries must read current + the single `.1` predecessor.
+  A second rotation handle would splice lines across files (P-44).
+- `iw event` line formats vary across iw versions (phy suffix or not,
+  freq in parens, `status:` vs `status`, one or two MAC arguments):
+  parse by keyword, extract what matches, ALWAYS keep the raw line,
+  and never drop an unrecognized line (kind=other) — an evidence
+  recorder must not lose what it does not understand (P-44).
+- NM property support drifts across versions (e.g.
+  ipv6.dhcp-send-hostname needs NM >= 1.36): a modify that fails on an
+  unknown property must degrade (drop the prop, warn) instead of
+  aborting a phase mid-experiment; the restore path must skip dropped
+  props symmetrically (P-44).
+- The boot-backfill journal read MUST be bounded by `-b` (current
+  boot): a zero watermark with `--since @0` without `-b` would ingest
+  the entire persistent journal on every engine restart (P-44).
 
 ## 6. Repository Conventions
 

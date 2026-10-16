@@ -1,0 +1,55 @@
+[Unit]
+Description=NetFend Wi-Fi Link Watcher — boot-early 802.11 evidence recorder
+Documentation=https://github.com/Vtheonly/NetFend
+# P-44: evidence must exist BEFORE the first association attempt of
+# every boot. The defense engine is After=network-online.target and the
+# owner's blocking happens while connecting — this unit is ordered ahead
+# of the network stack so nothing is missed. It is a READ-ONLY observer
+# (iw event + journalctl + state polls) and never touches kernel state,
+# so it can never conflict with the engine (P-41 discipline).
+DefaultDependencies=no
+After=systemd-udevd.service
+Wants=systemd-udevd.service
+Before=NetworkManager.service systemd-networkd.service wpa_supplicant.service netfend.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/netfend/net_defender.py --wifi-watch
+Restart=on-failure
+RestartSec=5
+
+# --- Privileges: read-only observer ---
+# CAP_NET_RAW: journal/none needed strictly, but `iw event` subscription
+# and the gateway ping probe are most reliable with it; CAP_NET_ADMIN:
+# some drivers restrict unprivileged nl80211 event delivery. The watcher
+# never writes kernel state (code-audited: only `iw event -f`,
+# `journalctl`, `ip ... show`, `nmcli -t ... show`, `ping -c1`).
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+# --- Filesystem hardening ---
+ProtectSystem=strict
+ReadWritePaths=/var/lib/netfend /run
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+
+# --- Resource limits (it is a logger, not a defender) ---
+MemoryMax=128M
+CPUQuota=20%
+
+# --- Logging ---
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=netfend-wifi-watch
+
+[Install]
+WantedBy=multi-user.target

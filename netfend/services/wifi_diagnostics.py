@@ -57,9 +57,9 @@ def parse_iw_link(output: str) -> Dict[str, Any]:
     m = re.search(r"SSID:\s*(.+)", output)
     if m:
         info["ssid"] = m.group(1).strip()
-    m = re.search(r"signal:\s*(-?\d+)\s*dBm", output)
+    m = re.search(r"signal:\s*(-?\d+(?:\.\d+)?)\s*dBm", output)
     if m:
-        info["rssi"] = int(m.group(1))
+        info["rssi"] = int(float(m.group(1)))   # kernels print "-63.00 dBm" (P-44)
     m = re.search(r"tx bitrate:\s*([\d.]+)", output)
     if m:
         info["tx_bitrate"] = float(m.group(1))
@@ -264,7 +264,11 @@ class SupplicantMonitor:
                 "(wifi.deauth_signature) disabled; state-transition counters "
                 "only", source="wifi")
             return False
-        self._watermark = time.time()   # only events from engine start on
+        self._watermark = 0.0   # P-44: backfill from boot start — the engine
+                                 # is After=network-online.target, so the FIRST
+                                 # association attempts of a boot predate engine
+                                 # start; the classifier's recency window
+                                 # filters stale observations anyway
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="nf-supplicant",
                                         daemon=True)
@@ -291,7 +295,7 @@ class SupplicantMonitor:
     def _poll_once(self) -> bool:
         """One bounded journal read. Returns True when the query worked."""
         since = max(0.0, self._watermark - 1.0)
-        out = _run(["journalctl", "-t", "wpa_supplicant", "-u", "NetworkManager",
+        out = _run(["journalctl", "-b", "-t", "wpa_supplicant", "-u", "NetworkManager",
                     "--since", f"@{since:.6f}", "-o", "short-unix", "--no-pager"])
         if out is None:
             return False

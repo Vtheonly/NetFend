@@ -17,12 +17,15 @@ if [ "$(id -u)" != "0" ]; then
   exit 1
 fi
 
-# 1) Stop and disable service
+# 1) Stop and disable services
 if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files netfend.service >/dev/null 2>&1; then
-  log "Stopping netfend service..."
+  log "Stopping netfend services..."
   systemctl stop netfend.service 2>/dev/null || true
   systemctl disable netfend.service 2>/dev/null || true
   rm -f /etc/systemd/system/netfend.service
+  systemctl stop netfend-wifi-watch.service 2>/dev/null || true
+  systemctl disable netfend-wifi-watch.service 2>/dev/null || true
+  rm -f /etc/systemd/system/netfend-wifi-watch.service
   systemctl daemon-reload
 fi
 

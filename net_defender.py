@@ -8,6 +8,9 @@ Commands:
   --events [N]            show last N security events
   --scan                  one-shot active local network discovery (explicit)
   --gateway-rebaseline    re-learn gateway identity (after router replacement)
+  wifi <cmd>              link evidence + identity A/B experiment (P-44):
+                           wifi watch|events|identity|abtest|report
+                           (run `netfend wifi --help` for details)
   --list-devices          list observed devices
   --authorize MAC         mark device authorized (bookkeeping only)
   --deauthorize MAC       mark device unauthorized (bookkeeping only)
@@ -20,6 +23,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
@@ -71,6 +75,26 @@ def cmd_status():
         pass
     v6 = "suppress RAs" if not _has_ipv6_route() else "monitor RA sources"
     print(f"  ipv6      : {cfg('ipv6', 'ra_guard', 'auto')} — will {v6}")
+    # P-44: link-evidence watcher (separate boot-early service)
+    try:
+        import subprocess
+        r = subprocess.run(["systemctl", "is-active", "netfend-wifi-watch"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 4:  # 4 = no such unit
+            state = r.stdout.strip()
+            try:
+                from netfend.services.link_watcher import evidence_query
+                import time as _t
+                recent = evidence_query(since=_t.time() - 3600)
+                deauths = sum(1 for x in recent
+                              if x.get("kind") == "deauth"
+                              and x.get("locally_generated") == 0)
+                print(f"  wifi-watch: {state} — last hour: {len(recent)} evidence "
+                      f"records, {deauths} incoming deauths")
+            except Exception:
+                print(f"  wifi-watch: {state}")
+    except Exception:
+        pass
     print("-" * 60)
     print("  capabilities:")
     for note in caps["notes"] or ["all capabilities present"]:
@@ -112,6 +136,9 @@ def cmd_doctor():
           else "deauth-signature detection (wifi.deauth_signature) disabled")
     check("monitor mode support", caps["monitor_mode"],
           "frame-level deauth detection needs it; 802.11w/PMF recommended on AP")
+    check("NetworkManager CLI (identity experiment)", caps.get("nmcli", False),
+          "" if caps.get("nmcli", False)
+          else "identity A/B experiment unavailable (wifi abtest)")
     check("systemd", caps["systemd_running"], "")
 
     # config sanity
@@ -396,7 +423,116 @@ def run_service():
     return 0
 
 
+def main_wifi(argv):
+    """`netfend wifi ...` — link evidence + identity A/B experiment (P-44).
+
+    Dispatched from main() by a pre-scan of sys.argv so the legacy
+    flag-style CLI keeps its exact behavior.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="netfend wifi",
+        description="Wi-Fi link-evidence recorder and identity A/B "
+                    "experiment (P-44: is the blocking tied to this "
+                    "device's identity, or does it follow any device?)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("watch", help="run the boot-early link-evidence watcher "
+                                 "in the foreground (the systemd service "
+                                 "netfend-wifi-watch runs this)")
+
+    ev = sub.add_parser("events", help="show recent link-evidence records")
+    ev.add_argument("count", nargs="?", type=int, default=30,
+                    help="last N records (default 30)")
+    ev.add_argument("--kind", action="append",
+                    help="filter by kind (repeatable): deauth, state, "
+                         "marker, deauth_burst, gateway_flap, ...")
+    ev.add_argument("--since-s", type=int, default=None,
+                    help="only records from the last N seconds")
+
+    ident = sub.add_parser("identity", help="show / randomize / restore "
+                                            "the Wi-Fi connection identity")
+    ident.add_argument("action", choices=["show", "random", "restore"])
+    ident.add_argument("--profile", help="pin the NM connection profile by name")
+    ident.add_argument("--ssid", help="pin the profile by SSID substring")
+
+    ab = sub.add_parser("abtest", help="run the identity A/B experiment "
+                                       "(real vs randomized identity)")
+    ab.add_argument("--cycles", type=int, help="real+random pairs (default 2)")
+    ab.add_argument("--dwell", type=int, help="observation seconds per phase "
+                                              "(default 300)")
+    ab.add_argument("--connect-timeout", type=int,
+                    help="seconds to wait for assoc+IP (default 90)")
+    ab.add_argument("--profile", help="pin the NM connection profile by name")
+    ab.add_argument("--ssid", help="pin the profile by SSID substring")
+    ab.add_argument("--band", choices=["a", "bg"],
+                    help="pin the radio band for BOTH phases (a=5 GHz, "
+                         "bg=2.4 GHz) — controlled comparison")
+    ab.add_argument("--random-first", action="store_true",
+                    help="try the randomized identity first")
+    ab.add_argument("--yes", action="store_true", help="skip confirmation")
+
+    rep = sub.add_parser("report", help="print the latest A/B report")
+    rep.add_argument("path", nargs="?", help="report file (default: latest)")
+
+    args = parser.parse_args(argv)
+    load_config()
+
+    if args.cmd == "watch":
+        from netfend.services.link_watcher import run_watcher
+        return run_watcher()
+
+    if args.cmd == "events":
+        from netfend.services.link_watcher import evidence_query, format_record
+        import time as _t
+        since = (_t.time() - args.since_s) if args.since_s else None
+        recs = evidence_query(since=since, kinds=args.kind,
+                              limit=max(1, args.count))
+        if not recs:
+            print("No link-evidence records"
+                  + (f" (kind={args.kind})" if args.kind else "")
+                  + ". Is the watcher running? "
+                    "systemctl status netfend-wifi-watch")
+            return 0
+        for rec in recs:
+            print(format_record(rec))
+        print(f"-- {len(recs)} record(s)"
+              + (f", kinds={args.kind}" if args.kind else "")
+              + (f", last {args.since_s}s" if args.since_s else ""))
+        return 0
+
+    if args.cmd == "identity":
+        from netfend.services.identity_lab import cmd_identity
+        return cmd_identity(args.action, profile=args.profile, ssid=args.ssid)
+
+    if args.cmd == "abtest":
+        from netfend.services.identity_lab import run_abtest
+        return run_abtest(
+            profile=args.profile, ssid=args.ssid, cycles=args.cycles,
+            dwell_s=args.dwell, connect_timeout_s=args.connect_timeout,
+            band=args.band, random_first=args.random_first,
+            confirm=not args.yes)
+
+    if args.cmd == "report":
+        from netfend.services.identity_lab import latest_report_path
+        path = Path(args.path) if args.path else latest_report_path()
+        if not path or not Path(path).is_file():
+            print("No A/B report found. Run an experiment first: "
+                  "sudo netfend wifi abtest")
+            return 1
+        print(Path(path).read_text())
+        return 0
+    return 1
+
+
 def main():
+    # `netfend wifi <cmd>` subcommand group (P-44) — pre-scanned BEFORE
+    # the flag parser (argparse would reject the subcommand tokens as
+    # unknown positionals); the legacy flag-style CLI is untouched
+    if len(sys.argv) > 1 and sys.argv[1] == "wifi":
+        sys.exit(main_wifi(sys.argv[2:]) or 0)
+
     parser = argparse.ArgumentParser(
         description=f"NetFend v{__version__} — lightweight network defense engine")
     parser.add_argument("--service", action="store_true",
@@ -411,6 +547,10 @@ def main():
                         help="one-shot active discovery (explicit, never periodic)")
     parser.add_argument("--gateway-rebaseline", action="store_true",
                         help="re-learn gateway MAC (after router replacement)")
+    parser.add_argument("--wifi-watch", action="store_true",
+                        help="run the boot-early link-evidence watcher in the "
+                             "foreground (the netfend-wifi-watch service "
+                             "runs this)")
     parser.add_argument("--dry-run", action="store_true",
                         help="never modify kernel state (diagnostics only)")
 
@@ -439,6 +579,9 @@ def main():
         cmd_scan()
     elif args.gateway_rebaseline:
         cmd_gateway_rebaseline()
+    elif args.wifi_watch:
+        from netfend.services.link_watcher import run_watcher
+        sys.exit(run_watcher() or 0)
     else:
         from netfend.services.device_registry import DeviceRegistry
         from netfend.services.threat_intelligence import ThreatIntelligence

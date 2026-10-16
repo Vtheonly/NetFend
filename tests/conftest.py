@@ -27,6 +27,7 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setattr(config_mod, "EVENTS_FILE", tmp_path / "events.jsonl")
     monkeypatch.setattr(config_mod, "LOG_FILE", tmp_path / "netfend.log")
     monkeypatch.setattr(config_mod, "DASHBOARD_TOKEN_FILE", tmp_path / "dashboard.token")
+    monkeypatch.setattr(config_mod, "LINK_EVIDENCE_FILE", tmp_path / "link-evidence.jsonl")
     yield tmp_path
 
 

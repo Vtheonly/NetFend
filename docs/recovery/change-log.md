@@ -530,3 +530,57 @@ client-side ground truth for WHY a link dropped, they need no monitor
 mode, and the owner needs to know that this attack class is fixed at
 the ROUTER (PMF/WPA3), not by passwords. Evidence: TestDeauthSignature
 (9) + TestSupplicantMonitor (7); suite 264 passing; doctor 16 checks.
+
+2026-10-16 — **T-43** (identity A/B experiment + boot-early evidence, P-44) —
+
+Router-side mitigations are exhausted on the owner's network: the FAYER
+router is WPA2-only with no 802.11w/PMF support and the Wi-Fi passphrase
+must stay ~8 characters (family constraint, elderly users), so neither
+PMF/WPA3 nor a strong PSK is available. The remaining discriminator for
+"who is being targeted and at which layer" had to move entirely to the
+client. Delivered in three parts:
+
+1. `netfend/services/link_watcher.py` + `netfend-wifi-watch.service`: a
+   boot-early READ-ONLY evidence recorder ordered `Before=NetworkManager`
+   (DefaultDependencies=no), so the very first association attempt of
+   every boot is captured — the window where the owner's blocking
+   actually happens. Sources: `iw event -f` (kernel 802.11 management
+   events), boot-backfilled journalctl reason codes (same bounded-poller
+   pattern as P-43), and state polls (iw link + ip addr/route/neigh +
+   one gateway ping), all into one JSONL log where every record carries
+   the MAC address in use at observation time — the annotation that
+   makes A/B phases interpretable after the fact. Pattern records:
+   deauth bursts (reuses classify_deauth_signature) and gateway-MAC
+   flapping while associated. The watcher never touches kernel state and
+   holds its own flock (/run/netfend.wifi-watch.lock), so it cannot
+   fight the engine (P-41 discipline); rotation keeps one predecessor
+   file and external writers (phase markers) open per write so rotation
+   can never splice a line.
+
+2. `netfend/services/identity_lab.py`: the identity experiment with a
+   restore contract. Backup file is the atomic recovery point (created
+   before anything changes, deleted only after a VERIFIED restore,
+   auto-heals a leftover from a crashed run); every phase (real vs
+   randomized locally-administered MAC + dhcp-send-hostname suppression)
+   writes markers into the evidence log, reconnects, polls
+   assoc/IP/gateway state, and classifies the outcome — including
+   `connected_no_gw` for the L3-cut signature (associated + IP but the
+   gateway never answers = ARP-level cut, the NetCut case). The verdict
+   matrix distinguishes: identity_targeted (static target list keyed on
+   the usual MAC/hostname), not_identity_only (whitelist-style
+   re-learning or non-identity blocking), no_active_blocking (must
+   repeat during an incident), unknown_mac_rejected (router-side
+   access control — check before concluding anything). Reports (md+json)
+   land in DATA_DIR/abtest/ with the evidence timeline attached.
+
+3. CLI `netfend wifi watch|events|identity|abtest|report` (pre-scanned
+   before the flag parser so the legacy CLI is untouched) + doctor check
+   for nmcli + wifi-watch line in --status.
+
+Two latent bugs fixed en route: SupplicantMonitor now backfills the
+whole current boot (watermark 0 + `-b` bound — the engine previously
+started blind to the exact window under attack), and parse_iw_link now
+accepts float dBm ("-63.00 dBm", what modern kernels print). Suite 264
+-> 334 passing (+70). Version 2.3.0. Remaining owner actions: U-17
+(watcher ordering on his distro), U-18 (NM property support), U-19
+(the verdict only means something during a blocking episode).

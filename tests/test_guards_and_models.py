@@ -514,6 +514,31 @@ class TestSupplicantMonitor:
         assert st["active"] is False            # start() not called
         assert st["incoming_deauth_disconnects"] == 4
 
+    def test_poll_boot_bounded_backfill(self, events, monkeypatch):
+        """P-44: watermark starts at 0 (backfill the whole boot — the
+        engine is After=network-online.target and misses the first
+        association attempts), so the journal query MUST be bounded by
+        -b (current boot only, never the whole persistent journal)."""
+        import netfend.services.wifi_diagnostics as wmod
+        from netfend.services.wifi_diagnostics import SupplicantMonitor
+
+        captured = {}
+
+        def fake_run(cmd):
+            captured["cmd"] = list(cmd)
+            return ""
+
+        monkeypatch.setattr(wmod, "cfg", lambda s, k, d=None: {
+            "deauth_threshold": 4, "deauth_window_s": 180}.get(k, d))
+        monkeypatch.setattr(wmod, "_run", fake_run)
+        m = SupplicantMonitor(events)
+        assert m._watermark == 0.0        # set by start(); poll uses it
+        m._watermark = 0.0
+        m._poll_once()
+        assert "-b" in captured["cmd"]
+        assert captured["cmd"][
+            captured["cmd"].index("--since") + 1].startswith("@0")
+
 
 class TestMetrics:
     def test_compute_rates(self):

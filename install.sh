@@ -17,6 +17,8 @@ DATA_DIR="/var/lib/netfend"
 CONFIG_DIR="/etc/netfend"
 UNIT_SRC="$SCRIPT_DIR/systemd/netfend.service"
 UNIT_DST="/etc/systemd/system/netfend.service"
+WATCH_UNIT_SRC="$SCRIPT_DIR/systemd/netfend-wifi-watch.service"
+WATCH_UNIT_DST="/etc/systemd/system/netfend-wifi-watch.service"
 CLI_SRC="$SCRIPT_DIR/net_defender.py"
 CLI_LINK="/usr/local/bin/netfend"
 LEGACY_LAUNCHER_SRC="$SCRIPT_DIR/scripts/legacy-launchers.sh"
@@ -153,26 +155,44 @@ install_service() {
     warn "systemctl not found — skipping service install (engine can run manually: sudo $INSTALL_DIR/net_defender.py)"
     return
   fi
-  log "Installing systemd service..."
+  log "Installing systemd services..."
   run cp "$UNIT_SRC" "$UNIT_DST"
   run cp "$SCRIPT_DIR/scripts/cleanup.sh" "$INSTALL_DIR/scripts/cleanup.sh" 2>/dev/null || {
     run mkdir -p "$INSTALL_DIR/scripts"
     run cp "$SCRIPT_DIR/scripts/cleanup.sh" "$INSTALL_DIR/scripts/cleanup.sh"
   }
   run chmod 755 "$INSTALL_DIR/scripts/cleanup.sh"
+  # P-44: boot-early link-evidence watcher (read-only observer, ordered
+  # Before=NetworkManager so the first association attempt of every boot
+  # is recorded)
+  if [ -f "$WATCH_UNIT_SRC" ]; then
+    run cp "$WATCH_UNIT_SRC" "$WATCH_UNIT_DST"
+  else
+    warn "netfend-wifi-watch.service missing from source tree — skipping"
+  fi
   run systemctl daemon-reload
   run systemctl enable netfend.service
+  if [ -f "$WATCH_UNIT_DST" ]; then
+    run systemctl enable netfend-wifi-watch.service
+  fi
   ROLLBACK_MARKER+=("$UNIT_DST")
+  [ -f "$WATCH_UNIT_DST" ] && ROLLBACK_MARKER+=("$WATCH_UNIT_DST")
 }
 
 start_and_verify() {
   if [ "$NO_SERVICE" = "1" ] || ! command -v systemctl >/dev/null 2>&1; then
     return
   fi
-  log "Starting service and verifying..."
+  log "Starting services and verifying..."
   if [ "$DRY_RUN" = "1" ]; then
-    echo "[dry-run] systemctl restart netfend && sleep 3 && systemctl is-active netfend"
+    echo "[dry-run] systemctl restart netfend-wifi-watch netfend && sleep 3 && systemctl is-active netfend"
     return
+  fi
+  # watcher first: it is Before=NetworkManager on next boot; starting it
+  # now just begins evidence recording immediately
+  if [ -f "$WATCH_UNIT_DST" ]; then
+    systemctl restart netfend-wifi-watch.service 2>/dev/null || \
+      warn "netfend-wifi-watch failed to start (journalctl -u netfend-wifi-watch)"
   fi
   systemctl restart netfend.service
   sleep 3
@@ -232,7 +252,11 @@ main() {
   echo "                    net_watch           (status + dashboard URL)"
   echo "                    net_blacklist       (threat profiles)"
   echo "   CLI:             sudo netfend --status / --doctor / --events 20"
+  echo "   Wi-Fi evidence:   sudo netfend wifi events --kind deauth"
+  echo "   Identity A/B:     sudo netfend wifi abtest   (is the blocking tied"
+  echo "                     to this device's identity? auto-restores after)"
   echo "   Service:         systemctl status netfend"
+  echo "   Watcher:         systemctl status netfend-wifi-watch"
   echo "   Dashboard:       http://127.0.0.1:8787/  (localhost only)"
   echo "   Token file:      $DATA_DIR/dashboard.token (chmod 600)"
   echo "   Config:          $CONFIG_DIR/config.json"
